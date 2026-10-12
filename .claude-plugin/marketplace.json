@@ -1,0 +1,25 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "koubek-plugins",
+  "description": "Jakub Vaňák's Claude Code plugins: Business Central on Linux inside Docker sandboxes, and companions.",
+  "owner": {
+    "name": "Jakub Vaňák",
+    "email": "vanak.jakub@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "bc-linux",
+      "source": "./plugins/bc-linux",
+      "description": "Run a real Business Central (NST + SQL) inside an sbx sandbox with Docker and drive it with the bcl CLI: instances, snapshots, compile, publish, AL test runners.",
+      "category": "development",
+      "tags": ["business-central", "al", "docker", "sbx", "testing"]
+    },
+    {
+      "name": "npcore-bc-linux",
+      "source": "./plugins/npcore-bc-linux",
+      "description": "NpCore / NP Retail companion to bc-linux: the verified recipe for NP Retail + NP Retail Tests on a local BC28/BC29.",
+      "category": "development",
+      "tags": ["business-central", "al", "navipartner", "np-retail"]
+    }
+  ]
+}

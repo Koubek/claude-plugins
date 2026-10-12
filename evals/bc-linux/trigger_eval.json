@@ -1,0 +1,22 @@
+[
+  {"query": "I have an AL extension in ~/src/contoso-app, can you spin up Business Central in this sandbox and run its test codeunits?", "should_trigger": true},
+  {"query": "is it possible to run a BC server locally in this docker sandbox instead of waiting for a cloud sandbox to be created?", "should_trigger": true},
+  {"query": "publish out/Contoso_Inventory_1.0.0.0.app to a real Business Central and tell me whether the install codeunit throws", "should_trigger": true},
+  {"query": "the sandbox restarted overnight, start the local BC 29 again and get my extension back - we saved a snapshot called demo yesterday", "should_trigger": true},
+  {"query": "my AL test codeunit 50100 only fails on a server, run it against an actual BC 28 here and show me which method fails", "should_trigger": true},
+  {"query": "I need a Business Central with full-text search for my app's OptimizeForTextSearch fields, publishing keeps failing with 'Full-Text Search component is not installed'", "should_trigger": true},
+  {"query": "how do I connect VS Code on my Mac to the Business Central that's running inside this sandbox so I can attach the debugger?", "should_trigger": true},
+  {"query": "run all the test codeunits of the test app in ./test against Business Central and give me a JUnit xml I can attach to the PR", "should_trigger": true},
+  {"query": "compile my app against the exact build of the BC instance we have running here and publish it", "should_trigger": true},
+  {"query": "the local business central container stopped answering on port 7049, figure out what's wrong and restart it", "should_trigger": true},
+  {"query": "compile the AL app in ./app and list the compiler errors, I don't need any server for that", "should_trigger": false},
+  {"query": "write a GitHub Actions workflow for our repo that runs the AL tests on ubuntu-latest using MsDyn365Bc.On.Linux's reusable bc-test workflow", "should_trigger": false},
+  {"query": "deploy my extension to the customer's production BC SaaS tenant through the admin center API", "should_trigger": false},
+  {"query": "explain the difference between OptimizeForTextSearch and a normal secondary key on an AL table", "should_trigger": false},
+  {"query": "write an AL test codeunit for the new discount calculation - only write it, I'll run it myself later", "should_trigger": false},
+  {"query": "set up a Windows BC container on my Azure VM with BcContainerHelper's New-BcContainer and give me the PowerShell", "should_trigger": false},
+  {"query": "my docker compose for a postgres + node api fails with 'port is already allocated', can you help?", "should_trigger": false},
+  {"query": "what's new for AL developers in Business Central 2026 release wave 2?", "should_trigger": false},
+  {"query": "convert this old C/AL report object to an AL report extension", "should_trigger": false},
+  {"query": "get me the next free object id in my app.json idRanges for a new table", "should_trigger": false}
+]

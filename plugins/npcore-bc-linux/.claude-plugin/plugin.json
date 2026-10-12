@@ -1,0 +1,11 @@
+{
+  "name": "npcore-bc-linux",
+  "version": "1.0.0",
+  "description": "NpCore / NP Retail companion to bc-linux: compile, publish and test NP Retail + NP Retail Tests on a local BC28/BC29 (--fts, the npretail snapshot, test ids, bcdev, timings).",
+  "author": {
+    "name": "Jakub Vaňák",
+    "email": "vanak.jakub@gmail.com"
+  },
+  "keywords": ["business-central", "al", "navipartner", "np-retail"],
+  "dependencies": ["bc-linux"]
+}

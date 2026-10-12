@@ -1,0 +1,10 @@
+{
+  "name": "bc-linux",
+  "version": "1.0.0",
+  "description": "Run a real Business Central (NST + SQL Server) locally inside an sbx sandbox with Docker, using StefanMaron/MsDyn365Bc.On.Linux, and drive it with the bcl CLI: instances, DB snapshots, work copies, compile, publish, AL test runners. BC28+.",
+  "author": {
+    "name": "Jakub Vaňák",
+    "email": "vanak.jakub@gmail.com"
+  },
+  "keywords": ["business-central", "al", "docker", "sbx", "linux", "testing"]
+}

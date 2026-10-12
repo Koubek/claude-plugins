@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Plugin entry point: Claude Code puts this plugin's bin/ on the Bash tool's PATH, so `bcl`
+# works as a bare command. The real CLI lives in the self-contained skill folder.
+exec bash "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../skills/bc-linux/bin/bcl" "$@"

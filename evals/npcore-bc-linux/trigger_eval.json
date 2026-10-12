@@ -1,0 +1,82 @@
+[
+  {
+    "query": "can you spin up a BC 28 in here so I can run my AL tests? I really don't want to wait 35 min for crane again",
+    "should_trigger": true
+  },
+  {
+    "query": "I changed the posting logic in Application/src/POS Core/POSPostEntries.Codeunit.al \u2014 publish it to a real Business Central and run the POS tests (codeunits 85000..85020), the sandbox is fine for that",
+    "should_trigger": true
+  },
+  {
+    "query": "run NP Retail test codeunit 85006 locally and tell me if it's still green after my change to the receipt printing",
+    "should_trigger": true
+  },
+  {
+    "query": "is there any way to get Business Central actually running inside this docker sandbox? like a linux container or something",
+    "should_trigger": true
+  },
+  {
+    "query": "the sandbox got restarted overnight, start the local BC again and get NP Retail back (we saved a snapshot called npretail yesterday)",
+    "should_trigger": true
+  },
+  {
+    "query": "my test app compiles fine but I need to know if the tests really pass \u2014 we have no SaaS sandbox available today, can you do it here?",
+    "should_trigger": true
+  },
+  {
+    "query": "publish build/NaviPartner_NP_Retail_9999.9999.9999.9999.app to the local bc container and check it installs without schema sync errors",
+    "should_trigger": true
+  },
+  {
+    "query": "set up a BC 29 instance with full text search, the SpeedGate entry log tables use OptimizeForTextSearch and publish keeps failing with AL1024",
+    "should_trigger": true
+  },
+  {
+    "query": "bcdev test returns 404 on /BC/cs/?tenant=default against the BC container running in this sandbox, how do I fix it",
+    "should_trigger": true
+  },
+  {
+    "query": "save the current BC database with NP Retail installed so next time I don't have to sit through the 11 minute publish again",
+    "should_trigger": true
+  },
+  {
+    "query": "Create a new Crane container from the CLOUD-CORE template and send me the URL and credentials once it's up",
+    "should_trigger": false
+  },
+  {
+    "query": "deploy the compiled NP Retail .app to our SaaS sandbox tenant MySandbox2 using the S2S app registration",
+    "should_trigger": false
+  },
+  {
+    "query": "just compile the Application project and tell me the AL errors, I don't need any server for this",
+    "should_trigger": false
+  },
+  {
+    "query": "get me the next free object ID for a new table extension in NP Retail",
+    "should_trigger": false
+  },
+  {
+    "query": "write an AL test codeunit for the new VAT rounding in POSPostEntries \u2014 only write it, I'll run it myself later in VS Code",
+    "should_trigger": false
+  },
+  {
+    "query": "what does BC_PUBLISH_TARGET in bc.dev.vars control and what are the allowed values?",
+    "should_trigger": false
+  },
+  {
+    "query": "our Dockerfile for the cloudflare worker local dev image fails on the npm ci step, can you look at it",
+    "should_trigger": false
+  },
+  {
+    "query": "explain how SentrySpan.Codeunit.al is supposed to be used when I want to measure a slow POS action",
+    "should_trigger": false
+  },
+  {
+    "query": "download the BC 28 symbols into Application/.alpackages with bcdev so IntelliSense works in VS Code",
+    "should_trigger": false
+  },
+  {
+    "query": "set up a GitHub Actions workflow for our repo that runs the AL tests on ubuntu-latest using MsDyn365Bc.On.Linux's reusable bc-test-from-source workflow",
+    "should_trigger": false
+  }
+]

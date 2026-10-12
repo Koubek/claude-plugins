@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# `al` shim for upstream's run-tests-altool.py (--transport cli).
+# 1. Newer AL tools (30.x prerelease builds) print structured JSON
+#    from `al runtests` by default; upstream parses the legacy text summary
+#    ("  PASS Name (12ms)"), which `--raw` restores. Without it every codeunit is
+#    reported as "no test results returned" although the tests ran and passed.
+# 2. Run from an empty directory. Upstream calls this from its own checkout, where
+#    `al runtests` picks up a project context and then rejects BC 29+ servers
+#    ("AL extension details ... Supported debuggers: ... 8.0" vs the server's 9.0),
+#    while the same call from a neutral directory just runs the tests.
+cd "${BCL_AL_CWD:-/tmp}" 2>/dev/null || true
+if [ "${1:-}" = "runtests" ]; then exec al "$@" --raw; fi
+exec al "$@"

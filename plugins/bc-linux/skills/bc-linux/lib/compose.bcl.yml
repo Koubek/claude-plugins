@@ -1,0 +1,35 @@
+# bcl compose override — layered on top of the upstream MsDyn365Bc.On.Linux
+# docker-compose.yml (COMPOSE_FILE=<upstream>/docker-compose.yml:<this file>).
+#
+# Keep this file minimal: everything BC-specific belongs upstream. It only adds
+# what an sbx sandbox needs on top: the single-port front door, the web client
+# public URL (not passed through by the upstream file) and container naming.
+services:
+  sql:
+    volumes:
+      # bcl snapshot save/restore: BACKUP/RESTORE DATABASE read and write SQL
+      # Server's OWN filesystem, so the snapshot store must be mounted here (the
+      # data dir itself is a tmpfs and dies with the container). Per BC version.
+      - ${BCL_SNAPSHOT_DIR:?BCL_SNAPSHOT_DIR must be set by bcl}:/bcl-snapshots
+
+  bc:
+    environment:
+      # Upstream's compose does not pass this one through, but the entrypoint
+      # reads it to set PublicWebBaseUrl (what the dev endpoint advertises to
+      # F5 / launchBrowser). bcl points it at the front door.
+      BC_WEBCLIENT_PUBLIC_URL: ${BC_WEBCLIENT_PUBLIC_URL:-}
+
+  frontdoor:
+    image: ${BCL_FRONTDOOR_IMAGE:-nginx:1.29-alpine}
+    depends_on:
+      bc:
+        condition: service_started
+    ports:
+      - "${BCL_FRONT_PORT:-7080}:80"
+    volumes:
+      - ${BCL_INSTANCE_DIR:?BCL_INSTANCE_DIR must be set by bcl}/frontdoor.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: wget -q -O /dev/null http://127.0.0.1/bcl-health || exit 1
+      interval: 5s
+      retries: 6
+      start_period: 5s

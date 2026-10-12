@@ -1,0 +1,1623 @@
+#!/usr/bin/env bash
+# bcl — Business Central on Linux, natively inside a Docker sandbox (sbx).
+#
+# Wraps StefanMaron/MsDyn365Bc.On.Linux (the bc-runner image + its scripts) with
+# what an sbx sandbox needs: host-side artifact caching on the big disk, pinned
+# upstream + image, per-instance port slots, a single-port "front door" so
+# tooling written for Windows BC containers (AL extension, launch.json-based
+# CLIs such as bcdev) works unchanged, and one
+# command per job: up / wait / status / publish / symbols / test / down.
+#
+# Run `bcl help` for usage. State lives in $BCL_HOME (default ~/.bc-linux).
+set -euo pipefail
+umask 022
+
+BCL_TOOL_VERSION="1.0.0"
+SKILL_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+BCL_HOME="${BCL_HOME:-$HOME/.bc-linux}"
+UPSTREAM_REPO="${BCL_UPSTREAM_REPO:-https://github.com/StefanMaron/MsDyn365Bc.On.Linux.git}"
+# Known-good upstream commit, verified end to end inside an sbx sandbox
+# (boot, publish, every test runner). Move it with `bcl update`/--ref.
+PINNED_REF="e05fb7f78c8ddddb1b157b5229ae338f5a993ac5"
+IMAGE_REPO="ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner"
+SQL_IMAGE_DEFAULT="ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-zstd"
+SQL_IMAGE_FTS="ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-fts"
+FRONTDOOR_IMAGE="nginx:1.29-alpine"
+ARTIFACT_INDEX_PROBE="https://bcartifacts-exdbf9fwegejdqak.b02.azurefd.net/sandbox/indexes/w1.json"
+ARTIFACT_INDEX_BASE="https://bcartifacts-exdbf9fwegejdqak.b02.azurefd.net"
+# Supported window: Microsoft's SaaS lifecycle — the current and the previous major, never
+# below BC28 (BCL_MIN_MAJOR overrides the floor). Older majors may still boot but are not
+# validated by this skill.
+BCL_MIN_MAJOR="${BCL_MIN_MAJOR:-28}"
+
+# ─── output helpers ──────────────────────────────────────────────────────────
+if [ -t 1 ]; then C_B=$'\e[1m'; C_R=$'\e[31m'; C_G=$'\e[32m'; C_Y=$'\e[33m'; C_0=$'\e[0m'; else C_B=; C_R=; C_G=; C_Y=; C_0=; fi
+log()  { printf '[bcl] %s\n' "$*" >&2; }
+ok()   { printf '[bcl] %sOK%s %s\n' "$C_G" "$C_0" "$*" >&2; }
+warn() { printf '[bcl] %sWARN%s %s\n' "$C_Y" "$C_0" "$*" >&2; }
+die()  { printf '[bcl] %sERROR%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+now()  { date +%s; }
+
+port_free() {  # $1=port → 0 if nothing listens on it (IPv4 or IPv6)
+  python3 - "$1" <<'PY'
+import socket, sys
+p = int(sys.argv[1])
+for fam, addr in ((socket.AF_INET, "0.0.0.0"), (socket.AF_INET6, "::")):
+    s = socket.socket(fam, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((addr, p))
+    except OSError:
+        sys.exit(1)
+    finally:
+        s.close()
+PY
+}
+
+# ─── instance model ──────────────────────────────────────────────────────────
+# One instance = one compose project "bcl-<name>" (sql + bc + frontdoor) and a
+# directory $BCL_HOME/instances/<name> holding instance.env (the single source
+# of truth for compose), the front-door config, launch.json and connection.env.
+BCL_NAME="${BCL_INSTANCE:-default}"
+INST_DIR=""
+
+set_instance() {
+  BCL_NAME="$1"
+  [[ "$BCL_NAME" =~ ^[a-z0-9][a-z0-9_-]{0,30}$ ]] || die "invalid instance name '$BCL_NAME' (lowercase letters, digits, - and _)"
+  INST_DIR="$BCL_HOME/instances/$BCL_NAME"
+}
+
+instance_exists() { [ -f "$INST_DIR/instance.env" ]; }
+
+load_instance() {  # sources instance.env into this shell (not exported)
+  instance_exists || die "instance '$BCL_NAME' does not exist — create it with: bcl up --name $BCL_NAME"
+  # shellcheck disable=SC1091
+  . "$INST_DIR/instance.env"
+}
+
+# Run a command with ONLY this instance's settings visible to compose/upstream
+# scripts. Anything BC_*/SQL_*/DOTNET_* the caller's shell happens to export
+# (e.g. from a sourced bc.dev.vars) must not leak into the containers.
+in_instance_env() {
+  (
+    for v in $(compgen -e); do
+      case "$v" in BC_*|SQL_*|SA_PASSWORD|MSSQL_*|COMPOSE_*|DOTNET_gc*|DOTNET_GC*|DOTNET_Tiered*|DOTNET_TC_*|DOTNET_ReadyToRun) unset "$v" ;; esac
+    done
+    set -a
+    # shellcheck disable=SC1091
+    . "$INST_DIR/instance.env"
+    set +a
+    export COMPOSE_PROJECT_NAME="bcl-$BCL_NAME"
+    export COMPOSE_FILE="$BCL_UPSTREAM_DIR/docker-compose.yml:$INST_DIR/compose.bcl.yml"
+    export BCL_INSTANCE_DIR="$INST_DIR"
+    export BCL_SNAPSHOT_DIR="${BCL_SNAPSHOT_DIR:-$BCL_HOME/snapshots/$(basename "$BC_ARTIFACTS_DIR")}"
+    "$@"
+  )
+}
+compose() { in_instance_env docker compose "$@"; }
+
+container_id() { docker ps -aq --filter "label=com.docker.compose.project=bcl-$BCL_NAME" --filter "label=com.docker.compose.service=$1" | head -1; }
+bc_health() {
+  local cid; cid=$(container_id bc)
+  [ -n "$cid" ] || { echo "absent"; return; }
+  docker inspect -f '{{.State.Status}}/{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || echo "absent"
+}
+
+with_lock() {  # serialize up/down per instance across concurrent agents
+  mkdir -p "$INST_DIR"
+  exec 9>"$INST_DIR/.lock"
+  if ! flock -w 1800 9; then die "timed out waiting for the instance lock ($INST_DIR/.lock)"; fi
+}
+
+urls() {  # derive endpoint URLs from the loaded instance
+  DEV_URL="http://localhost:$BC_DEV_PORT/BC/dev"
+  ODATA_URL="http://localhost:$BC_ODATA_PORT/BC/ODataV4"
+  API_URL="http://localhost:$BC_API_PORT/BC/api"
+  if [ "${BCL_FRONTDOOR:-1}" = "1" ]; then
+    FRONT_URL="http://localhost:$BCL_FRONT_PORT/BC"
+    LAUNCH_PORT="$BCL_FRONT_PORT"
+  else
+    FRONT_URL=""
+    LAUNCH_PORT="$BC_DEV_PORT"
+  fi
+  WEB_URL=""
+  if [ "${BC_WEBCLIENT:-0}" = "1" ]; then
+    if [ -n "$FRONT_URL" ]; then WEB_URL="$FRONT_URL/"; else WEB_URL="http://localhost:$BC_WEBCLIENT_PORT/BC/"; fi
+  fi
+  AUTH="$BC_SERVER_USERNAME:$BC_SERVER_PASSWORD"
+  LAUNCH_NAME="bcl-$BCL_NAME"
+}
+
+# ─── upstream checkout + image ───────────────────────────────────────────────
+resolve_ref() {  # ref (branch/tag/sha) → full sha
+  local ref="$1" sha=""
+  [ "$ref" = "pinned" ] && ref="$PINNED_REF"
+  if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then echo "$ref"; return; fi
+  sha=$(git ls-remote "$UPSTREAM_REPO" "refs/heads/$ref" "refs/tags/$ref" 2>/dev/null | head -1 | cut -f1 || true)
+  if [ -z "$sha" ] && [[ "$ref" =~ ^[0-9a-f]{7,39}$ ]]; then
+    local d; d=$(mktemp -d "$BCL_HOME/tmp/ref.XXXXXX")
+    git clone --quiet --filter=blob:none --no-checkout "$UPSTREAM_REPO" "$d" >/dev/null 2>&1 \
+      && sha=$(git -C "$d" rev-parse --verify --quiet "$ref^{commit}" || true)
+    rm -rf "$d"
+  fi
+  [ -n "$sha" ] || die "cannot resolve upstream ref '$ref' in $UPSTREAM_REPO"
+  echo "$sha"
+}
+
+ensure_upstream() {  # sha → prints checkout dir
+  local sha="$1" dir="$BCL_HOME/upstream/$1"
+  if [ ! -f "$dir/.bcl-complete" ]; then
+    log "fetching upstream MsDyn365Bc.On.Linux @ ${sha:0:12} ..."
+    mkdir -p "$BCL_HOME/upstream"
+    rm -rf "$dir.tmp"
+    git clone --quiet --filter=blob:none --no-checkout "$UPSTREAM_REPO" "$dir.tmp" >&2 \
+      || die "git clone of $UPSTREAM_REPO failed (network policy? try: curl -sI https://github.com)"
+    git -C "$dir.tmp" -c advice.detachedHead=false checkout --quiet "$sha" >&2 || die "upstream commit $sha not found"
+    touch "$dir.tmp/.bcl-complete"
+    rm -rf "$dir"; mv "$dir.tmp" "$dir"
+  fi
+  echo "$dir"
+}
+
+resolve_runner_image() {  # sha → image ref; per-commit tags exist for every master commit
+  local img="$IMAGE_REPO:$1"
+  if docker image inspect "$img" >/dev/null 2>&1 || docker manifest inspect "$img" >/dev/null 2>&1; then
+    echo "$img"
+  else
+    warn "no image tag for upstream ${1:0:12}; falling back to $IMAGE_REPO:latest (scripts and image may drift)"
+    echo "$IMAGE_REPO:latest"
+  fi
+}
+
+ensure_image() {
+  local img="$1" i
+  docker image inspect "$img" >/dev/null 2>&1 && return 0
+  for i in 1 2 3; do
+    log "pulling $img (attempt $i) ..."
+    docker pull -q "$img" >/dev/null && return 0
+    sleep $((i * 5))
+  done
+  die "could not pull $img"
+}
+
+run_isolated() {  # run "$@" in its own session; afterwards kill anything it left running
+  # Upstream's downloader can exit non-zero while its parallel range workers are still
+  # alive; left alone they keep fighting for bandwidth (and lose their temp dir).
+  local pid rc=0
+  setsid "$@" & pid=$!
+  wait "$pid" || rc=$?
+  pkill -TERM -s "$pid" 2>/dev/null || true
+  return "$rc"
+}
+
+# ─── artifacts (host side, on the big disk) ──────────────────────────────────
+# The upstream container would otherwise download ~2.4 GB of zips into its own
+# /tmp, i.e. onto the small Docker data disk. Downloading here and bind-mounting
+# the result is upstream's own CI design: the container sees the stamp and skips.
+artifact_request() {
+  if [ -n "${BC_ARTIFACT_URL:-}" ]; then echo "url|$BC_ARTIFACT_URL"; else echo "args|$BC_TYPE|$BC_VERSION|$BC_COUNTRY"; fi
+}
+artifacts_ready() {  # $1 = dir
+  [ -f "$1/app/manifest.json" ] && [ -d "$1/platform/ServiceTier" ] \
+    && grep -qxF "request=$(artifact_request)" "$1/.bc-artifact-cache" 2>/dev/null
+}
+artifact_version() {  # $1 = dir → "28.5.54151.55965 (platform 28.0.54946.55847, w1)"
+  python3 - "$1/app/manifest.json" <<'PY' 2>/dev/null || echo "?"
+import json, sys
+m = json.load(open(sys.argv[1]))
+print(f"{m.get('version','?')} (platform {m.get('platform','?')}, {m.get('country','?')})")
+PY
+}
+
+ensure_artifacts() {  # uses BC_TYPE/BC_VERSION/BC_COUNTRY/BC_ARTIFACT_URL/BC_ARTIFACTS_DIR; $1 = refresh(0/1)
+  local dir="$BC_ARTIFACTS_DIR" refresh="$1"
+  if [ "$refresh" != "1" ] && artifacts_ready "$dir"; then
+    ok "artifacts cached: $(artifact_version "$dir")"
+    return 0
+  fi
+  local need_kb=$((6 * 1024 * 1024)) free_kb
+  mkdir -p "$dir" "$BCL_HOME/tmp"
+  free_kb=$(df -Pk "$BCL_HOME" | awk 'NR==2{print $4}')
+  [ "$free_kb" -ge "$need_kb" ] || warn "only $((free_kb / 1024)) MB free under $BCL_HOME; a BC version needs ~6 GB while downloading (2.4 GB zips + 3.2 GB extracted). Free space with: bcl artifacts rm <key>"
+  log "downloading BC artifacts ($(artifact_request)) — ~2 min on a good link ..."
+  local t0 rc=0 args=() order; t0=$(now)
+  if [ -n "${BC_ARTIFACT_URL:-}" ]; then args=("$BC_ARTIFACT_URL"); else args=("$BC_TYPE" "$BC_VERSION" "$BC_COUNTRY"); fi
+  # Two download paths: the sandbox host (through the sbx proxy) and a throwaway bc-runner
+  # container (in sbx, containers egress directly, not via the host proxy). Seen in practice:
+  # after the host resumed from sleep every large transfer through the proxy failed (curl
+  # 7/28/56) while container downloads still worked. Probe both briefly and start with the
+  # one that moves bytes, falling back to the other; same downloader, same dest, same stamp.
+  ensure_image "$BC_RUNNER_IMAGE"
+  local probe_host probe_ctr
+  probe_host=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -r 0-2097151 "$ARTIFACT_INDEX_PROBE" 2>/dev/null || true)
+  if [[ "$probe_host" =~ ^20[06]$ ]]; then order="host container"
+  else
+    probe_ctr=$(docker run --rm --entrypoint curl "$BC_RUNNER_IMAGE" -s -o /dev/null -w '%{http_code}' --max-time 20 -r 0-2097151 "$ARTIFACT_INDEX_PROBE" 2>/dev/null || true)
+    if [[ "$probe_ctr" =~ ^20[06]$ ]]; then
+      warn "artifact CDN unreachable through the sbx proxy (HTTP ${probe_host:-000}) but reachable from containers — downloading from a container"
+      order="container host"
+    else order="host container"; fi
+  fi
+  local how
+  for how in $order; do
+    rc=0
+    rm -rf "$BCL_HOME/tmp"/tmp.* 2>/dev/null || true
+    if [ "$how" = "host" ]; then
+      TMPDIR="$BCL_HOME/tmp" run_isolated "$BCL_UPSTREAM_DIR/scripts/download-artifacts.sh" "${args[@]}" "$dir" >&2 || rc=$?
+    else
+      docker run --rm --user "$(id -u):$(id -g)" --entrypoint /bc/scripts/download-artifacts.sh \
+        -e TMPDIR=/dltmp -e HOME=/dltmp -v "$BCL_HOME/tmp:/dltmp" -v "$dir:/out" \
+        "$BC_RUNNER_IMAGE" "${args[@]}" /out >&2 || rc=$?
+    fi
+    [ "$rc" = "0" ] && break
+    warn "artifact download via $how failed (rc=$rc)"
+  done
+  [ "$rc" = "0" ] || die "artifact download failed from the host and from a container (output above). Network: curl -sI $ARTIFACT_INDEX_PROBE ; versions: bcl versions"
+  artifacts_ready "$dir" || die "artifacts in $dir are incomplete after download"
+  ok "artifacts ready in $(( $(now) - t0 ))s: $(artifact_version "$dir")"
+}
+
+# ─── instance files ──────────────────────────────────────────────────────────
+write_instance_env() {
+  local f="$INST_DIR/instance.env.new" v
+  {
+    echo "# bcl instance '$BCL_NAME' — generated by 'bcl up'. Edit via bcl up flags, not by hand."
+    for v in BCL_NAME BCL_SLOT BCL_REF BCL_UPSTREAM_DIR BCL_FRONTDOOR BCL_FRONT_PORT BCL_FRONTDOOR_IMAGE BCL_EXTRA_ENV \
+             BC_TYPE BC_VERSION BC_COUNTRY BC_ARTIFACT_URL BC_ARTIFACTS_DIR BC_RUNNER_IMAGE BC_SQL_IMAGE \
+             BC_SERVER_USERNAME BC_SERVER_PASSWORD SA_PASSWORD BC_DATABASE MSSQL_MEMORY_LIMIT_MB \
+             SQL_PORT BC_DEV_PORT BC_ODATA_PORT BC_API_PORT BC_MGMT_PORT BC_CLIENT_PORT BC_WEBCLIENT_PORT \
+             BC_WEBCLIENT BC_WEBCLIENT_PATHBASE BC_WEBCLIENT_PUBLIC_URL BC_LICENSE_HOST_PATH BC_LICENSE_FILE \
+             BCL_CLEAR_APPS BC_CLEAR_ALL_APPS BC_SKIP_APP_PUBLISH BC_KEEP_APP_IDS BCL_SNAPSHOT BCL_SNAPSHOT_DIR; do
+      printf '%s=%q\n' "$v" "${!v:-}"
+    done
+    # free-form upstream passthrough (--env KEY=VALUE), one per line
+    if [ -n "${BCL_EXTRA_ENV:-}" ]; then
+      while IFS= read -r kv; do [ -n "$kv" ] && printf '%s=%q\n' "${kv%%=*}" "${kv#*=}"; done <<< "$BCL_EXTRA_ENV"
+    fi
+  } > "$f"
+  mv "$f" "$INST_DIR/instance.env"
+}
+
+write_aux_files() {
+  urls
+  cp "$SKILL_DIR/lib/frontdoor.conf" "$INST_DIR/frontdoor.conf"
+  cp "$SKILL_DIR/lib/compose.bcl.yml" "$INST_DIR/compose.bcl.yml"
+  python3 - "$INST_DIR/launch.json" "$LAUNCH_NAME" "$LAUNCH_PORT" <<'PY'
+import json, sys
+path, name, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+base = {"type": "al", "environmentType": "OnPrem", "server": "http://localhost", "serverInstance": "BC",
+        "port": port, "tenant": "default", "authentication": "UserPassword"}
+cfgs = [
+    dict(base, name=name, request="launch", schemaUpdateMode="ForceSync", breakOnError="All",
+         launchBrowser=False, enableLongRunningSqlStatements=True, enableSqlInformationDebugger=True),
+    dict(base, name=name + " (attach)", request="attach", breakOnNext="WebClient", breakOnError="All"),
+]
+json.dump({"version": "0.2.0", "configurations": cfgs}, open(path, "w"), indent=2)
+PY
+  {
+    printf 'export BCL_INSTANCE=%q\n' "$BCL_NAME"
+    printf 'export BC_DEV_URL=%q\n' "$DEV_URL"
+    printf 'export BC_ODATA_URL=%q\n' "$ODATA_URL"
+    printf 'export BC_API_URL=%q\n' "$API_URL"
+    printf 'export BC_FRONT_URL=%q\n' "$FRONT_URL"
+    printf 'export BC_WEB_URL=%q\n' "$WEB_URL"
+    printf 'export BC_USERNAME=%q\n' "$BC_SERVER_USERNAME"
+    printf 'export BC_PASSWORD=%q\n' "$BC_SERVER_PASSWORD"
+    printf 'export BC_LAUNCH_JSON=%q\n' "$INST_DIR/launch.json"
+    printf 'export BC_LAUNCH_NAME=%q\n' "$LAUNCH_NAME"
+    printf 'export BC_SQL_PORT=%q\n' "$SQL_PORT"
+    printf 'export BC_SA_PASSWORD=%q\n' "$SA_PASSWORD"
+  } > "$INST_DIR/connection.env"
+}
+
+used_slots() {  # slots claimed by other instances
+  local f
+  for f in "$BCL_HOME"/instances/*/instance.env; do
+    [ -f "$f" ] || continue
+    [ "$(dirname "$f")" = "$INST_DIR" ] && continue
+    sed -n 's/^BCL_SLOT=//p' "$f"
+  done
+}
+slot_ports() {
+  local o=$(( $1 * 100 ))
+  SQL_PORT=$((11433 + o)); BC_DEV_PORT=$((7049 + o)); BC_ODATA_PORT=$((7048 + o)); BC_API_PORT=$((7052 + o))
+  BC_MGMT_PORT=$((7045 + o)); BC_CLIENT_PORT=$((7085 + o)); BC_WEBCLIENT_PORT=$((8080 + o)); BCL_FRONT_PORT=$((7080 + o))
+}
+slot_ports_free() {
+  local p
+  slot_ports "$1"
+  for p in $SQL_PORT $BC_DEV_PORT $BC_ODATA_PORT $BC_API_PORT $BC_MGMT_PORT $BC_CLIENT_PORT $BC_WEBCLIENT_PORT $BCL_FRONT_PORT; do
+    port_free "$p" || return 1
+  done
+}
+pick_slot() {
+  local s used; used=" $(used_slots | tr '\n' ' ') "
+  for s in 0 1 2 3 4 5 6 7 8 9; do
+    case "$used" in *" $s "*) continue ;; esac
+    slot_ports_free "$s" && { echo "$s"; return; }
+  done
+  die "no free port slot (0-9) — stop an instance with: bcl down --name <n>"
+}
+
+# ─── readiness ───────────────────────────────────────────────────────────────
+last_entrypoint_line() {
+  local cid; cid=$(container_id bc)
+  [ -n "$cid" ] && docker logs --tail 80 "$cid" 2>&1 | grep -E '^\[entrypoint\]' | tail -1 | cut -c1-160
+}
+
+wait_ready() {  # $1 = timeout minutes
+  local timeout_s=$(( ${1:-30} * 60 )) t0 last=0 st cid sql
+  t0=$(now)
+  log "waiting for BC to become healthy (timeout ${1:-30} min; typically 3-6 min in sbx) ..."
+  while :; do
+    st=$(bc_health)
+    case "$st" in
+      running/healthy) break ;;
+      */unhealthy) docker logs --tail 60 "$(container_id bc)" 2>&1 | sed 's/^/    /' >&2; die "bc container is unhealthy (logs above). Try: bcl logs --tail 300" ;;
+      exited/*|dead/*) docker logs --tail 80 "$(container_id bc)" 2>&1 | sed 's/^/    /' >&2; die "bc container exited during boot (logs above)" ;;
+    esac
+    sql=$(container_id sql)
+    if [ -n "$sql" ] && [ "$(docker inspect -f '{{.State.Status}}' "$sql" 2>/dev/null)" = "exited" ]; then
+      docker logs --tail 40 "$sql" 2>&1 | sed 's/^/    /' >&2; die "sql container exited (logs above)"
+    fi
+    if [ $(( $(now) - t0 )) -ge "$timeout_s" ]; then die "BC not healthy after ${1:-30} min (state=$st). Inspect: bcl logs --tail 300"; fi
+    if [ $(( $(now) - last )) -ge 30 ]; then
+      log "  $(( $(now) - t0 ))s  state=$st  $(last_entrypoint_line || true)"
+      last=$(now)
+    fi
+    sleep 3
+  done
+  ok "BC healthy after $(( $(now) - t0 ))s"
+  urls
+  if [ "${BC_WEBCLIENT:-0}" = "1" ]; then
+    local code="000" t1; t1=$(now)
+    while [ $(( $(now) - t1 )) -lt 240 ]; do
+      code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "${WEB_URL}" 2>/dev/null || true)
+      case "$code" in 200|302|301) break ;; esac
+      sleep 3
+    done
+    case "$code" in
+      200|302|301) ok "web client + client services (/BC/cs) up after $(( $(now) - t1 ))s more" ;;
+      *) warn "web client not answering yet (HTTP $code at $WEB_URL). NST is fine; bcdev test / browser need it. Check: bcl logs webclient" ;;
+    esac
+  fi
+}
+
+print_summary() {
+  urls
+  local ver; ver=$(artifact_version "$BC_ARTIFACTS_DIR")
+  cat >&2 <<EOF
+
+${C_B}BC '$BCL_NAME' is ready${C_0} — BC $ver, slot $BCL_SLOT
+  dev endpoint   $DEV_URL
+  OData v4       $ODATA_URL
+  API            $API_URL/v2.0
+EOF
+  [ -n "$FRONT_URL" ] && echo "  front door     $FRONT_URL  (dev + cs + OData + API + web client on ONE port — use this for bcdev / launch.json)" >&2
+  [ -n "$WEB_URL" ] && echo "  web client     $WEB_URL" >&2
+  cat >&2 <<EOF
+  credentials    $BC_SERVER_USERNAME / $BC_SERVER_PASSWORD   (NavUserPassword)
+  launch.json    $INST_DIR/launch.json   (config "$LAUNCH_NAME")
+  shell env      eval "\$(bcl env${BCL_NAME:+ --name $BCL_NAME})"
+EOF
+  if [ -n "${SANDBOX_NAME:-}" ] && [ -n "$FRONT_URL" ]; then
+    echo "  from the host  ask the user to run: sbx ports $SANDBOX_NAME --publish $BCL_FRONT_PORT:$BCL_FRONT_PORT   then open http://localhost:$BCL_FRONT_PORT/BC/" >&2
+  fi
+  if [ -n "${BCL_SNAPSHOT:-}" ]; then
+    echo "  database       restored from snapshot '$BCL_SNAPSHOT' (every bcl up of this instance restores it; --snapshot none to go back to CRONUS)" >&2
+  else
+    echo "  NOTE: the database is ephemeral (tmpfs) — every bcl up / hard restart starts from a fresh CRONUS." >&2
+    echo "        After publishing your apps once: bcl snapshot save <label>, then bcl up --snapshot <label>." >&2
+  fi
+}
+
+released_majors() {  # $1 type, $2 country → released majors (ascending), from Microsoft's artifact index
+  curl -fsS --max-time 30 "$ARTIFACT_INDEX_BASE/$1/indexes/$2.json" 2>/dev/null | python3 -c '
+import json, sys
+print(" ".join(map(str, sorted({int(r["Version"].split(".")[0]) for r in json.load(sys.stdin)}))))' 2>/dev/null
+}
+
+resolve_version_keyword() {  # latest | previous → major (SaaS lifecycle: current and previous major)
+  local kw="$1" majors latest
+  majors=$(released_majors "$BC_TYPE" "$BC_COUNTRY") || true
+  [ -n "$majors" ] || die "cannot read the BC artifact index to resolve '--version $kw' (network?) — pass a number, e.g. --version 28"
+  latest=$(echo "$majors" | tr ' ' '\n' | tail -1)
+  case "$kw" in
+    latest) echo "$latest" ;;
+    previous) echo $((latest - 1)) ;;
+  esac
+}
+
+# ─── commands ────────────────────────────────────────────────────────────────
+cmd_up() {
+  local version="" country="" type="" artifact_url="" slot="" fts="" sql_image="" webclient="" frontdoor="" license=""
+  local user="" password="" ref="" refresh=0 timeout=30 nowait=0 force=0 project="" clear_apps="" keep_ids="" extra_env=() reset_env=0 snapshot=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) set_instance "$2"; shift 2 ;;
+      -v|--version) version="$2"; shift 2 ;;
+      -c|--country) country="$2"; shift 2 ;;
+      --type) type="$2"; shift 2 ;;
+      --artifact-url) artifact_url="$2"; shift 2 ;;
+      --slot) slot="$2"; shift 2 ;;
+      --fts) fts=1; shift ;;
+      --no-fts) fts=0; shift ;;
+      --sql-image) sql_image="$2"; shift 2 ;;
+      --webclient) webclient=1; shift ;;
+      --no-webclient) webclient=0; shift ;;
+      --no-frontdoor) frontdoor=0; webclient="${webclient:-0}"; shift ;;
+      --license) license="$2"; shift 2 ;;
+      --user) user="$2"; shift 2 ;;
+      --password) password="$2"; shift 2 ;;
+      --ref) ref="$2"; shift 2 ;;
+      --refresh) refresh=1; shift ;;
+      --timeout) timeout="$2"; shift 2 ;;
+      --no-wait) nowait=1; shift ;;
+      --force) force=1; shift ;;
+      --project) project="$2"; shift 2 ;;
+      --clear-apps) clear_apps="$2"; shift 2 ;;
+      --keep-app-ids) keep_ids="$2"; shift 2 ;;
+      --env) extra_env+=("$2"); shift 2 ;;
+      --reset-env) reset_env=1; shift ;;
+      --snapshot) snapshot="$2"; shift 2 ;;
+      -h|--help) usage_up; return 0 ;;
+      *) die "unknown option for up: $1 (see: bcl up --help)" ;;
+    esac
+  done
+  [ -n "$INST_DIR" ] || set_instance "$BCL_NAME"
+  mkdir -p "$BCL_HOME/tmp" "$BCL_HOME/artifacts" "$INST_DIR"
+  with_lock
+
+  # Start from the existing instance's settings so a bare `bcl up` restarts what was there.
+  local old_env=""
+  if instance_exists; then old_env=$(grep -v '^#' "$INST_DIR/instance.env"); load_instance; fi
+
+  BC_TYPE="$(echo "${type:-${BC_TYPE:-sandbox}}" | tr 'A-Z' 'a-z')"
+  BC_COUNTRY="$(echo "${country:-${BC_COUNTRY:-w1}}" | tr 'A-Z' 'a-z')"
+  BC_VERSION="${version:-${BC_VERSION:-previous}}"   # new instances default to the previous released major (inside the SaaS window)
+  [ -n "$artifact_url" ] && BC_ARTIFACT_URL="$artifact_url"
+  [ -n "$version$country$type" ] && [ -z "$artifact_url" ] && BC_ARTIFACT_URL=""
+  BC_ARTIFACT_URL="${BC_ARTIFACT_URL:-}"
+  [[ "$BC_TYPE" =~ ^(sandbox|onprem)$ ]] || die "--type must be sandbox or onprem"
+  case "$BC_VERSION" in
+    latest|previous) local kw="$BC_VERSION"; BC_VERSION=$(resolve_version_keyword "$kw"); log "--version $kw → BC$BC_VERSION" ;;
+  esac
+  [[ "$BC_VERSION" =~ ^[0-9]+(\.[0-9]+){0,3}$ ]] || die "--version must be latest, previous, or look like 28, 28.5 or 28.5.54151.55965"
+  if [ "${BC_VERSION%%.*}" -lt "$BCL_MIN_MAJOR" ]; then
+    warn "BC${BC_VERSION%%.*} is below the supported window (BC$BCL_MIN_MAJOR and newer, following the SaaS lifecycle) — it may work, but it is not validated or supported"
+  fi
+
+  if [ -n "$BC_ARTIFACT_URL" ]; then
+    BC_ARTIFACTS_DIR="$BCL_HOME/artifacts/url-$(printf '%s' "$BC_ARTIFACT_URL" | sha1sum | cut -c1-12)"
+  else
+    BC_ARTIFACTS_DIR="$BCL_HOME/artifacts/$BC_TYPE-$BC_VERSION-$BC_COUNTRY"
+  fi
+
+  # Upstream ref: explicit > existing instance > pinned.
+  BCL_REF="$(resolve_ref "${ref:-${BCL_REF:-$PINNED_REF}}")"
+  BCL_UPSTREAM_DIR="$(ensure_upstream "$BCL_REF")"
+  if [ -n "$ref" ] || [ -z "${BC_RUNNER_IMAGE:-}" ]; then BC_RUNNER_IMAGE="$(resolve_runner_image "$BCL_REF")"; fi
+
+  # SQL image / full-text search. Apps with OptimizeForTextSearch fields need FTS.
+  if [ -z "$fts" ] && [ -n "$project" ]; then
+    if grep -rqiE --include='*.al' 'OptimizeForTextSearch[[:space:]]*=[[:space:]]*true' "$project" 2>/dev/null; then
+      log "project uses OptimizeForTextSearch → using the full-text-search SQL image"; fts=1
+    else fts=0; fi
+  fi
+  if [ -n "$sql_image" ]; then BC_SQL_IMAGE="$sql_image"
+  elif [ "$fts" = "1" ]; then BC_SQL_IMAGE="$SQL_IMAGE_FTS"
+  elif [ "$fts" = "0" ] || [ -z "${BC_SQL_IMAGE:-}" ]; then BC_SQL_IMAGE="$SQL_IMAGE_DEFAULT"; fi
+
+  BCL_FRONTDOOR="${frontdoor:-${BCL_FRONTDOOR:-1}}"
+  BC_WEBCLIENT="${webclient:-${BC_WEBCLIENT:-$BCL_FRONTDOOR}}"
+  BCL_FRONTDOOR_IMAGE="${BCL_FRONTDOOR_IMAGE:-$FRONTDOOR_IMAGE}"
+  BC_SERVER_USERNAME="${user:-${BC_SERVER_USERNAME:-BCRUNNER}}"
+  BC_SERVER_PASSWORD="${password:-${BC_SERVER_PASSWORD:-Admin123!}}"
+  SA_PASSWORD="${SA_PASSWORD:-Passw0rd123!}"
+  BC_DATABASE="${BC_DATABASE:-CRONUS}"
+  MSSQL_MEMORY_LIMIT_MB="${MSSQL_MEMORY_LIMIT_MB:-2048}"
+  [ -n "$clear_apps" ] && BCL_CLEAR_APPS="$clear_apps"
+  BCL_CLEAR_APPS="${BCL_CLEAR_APPS:-false}"
+  # Snapshot store is per artifact set (a backup only restores onto the BC build it came from).
+  BCL_SNAPSHOT_DIR="$BCL_HOME/snapshots/$(basename "$BC_ARTIFACTS_DIR")"
+  mkdir -p "$BCL_SNAPSHOT_DIR"; chmod 0777 "$BCL_SNAPSHOT_DIR"   # SQL Server (uid 10001) writes backups here
+  if [ -n "$snapshot" ]; then
+    if [ "$snapshot" = "none" ]; then BCL_SNAPSHOT=""; else BCL_SNAPSHOT="$snapshot"; fi
+  fi
+  BCL_SNAPSHOT="${BCL_SNAPSHOT:-}"
+  if [ -n "$BCL_SNAPSHOT" ]; then
+    [ -f "$BCL_SNAPSHOT_DIR/$BCL_SNAPSHOT.bak" ] || die "snapshot '$BCL_SNAPSHOT' not found for $(basename "$BC_ARTIFACTS_DIR") — see: bcl snapshot ls   (or --snapshot none)"
+    # Booting from a snapshot: keep exactly the apps in the backup, publish nothing.
+    BC_CLEAR_ALL_APPS="none"; BC_SKIP_APP_PUBLISH="true"
+  else
+    BC_CLEAR_ALL_APPS="$BCL_CLEAR_APPS"; BC_SKIP_APP_PUBLISH="false"
+  fi
+  [ -n "$keep_ids" ] && BC_KEEP_APP_IDS="$keep_ids"
+  BC_KEEP_APP_IDS="${BC_KEEP_APP_IDS:-}"
+  if [ "$reset_env" = "1" ]; then BCL_EXTRA_ENV=""; fi
+  local kv
+  for kv in "${extra_env[@]+"${extra_env[@]}"}"; do
+    [[ "$kv" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || die "--env expects KEY=VALUE, got '$kv'"
+    BCL_EXTRA_ENV="$(printf '%s\n%s' "${BCL_EXTRA_ENV:-}" "$kv" | grep -v "^${kv%%=*}=" ; echo "$kv")"
+  done
+  BCL_EXTRA_ENV="$(printf '%s' "${BCL_EXTRA_ENV:-}" | sed '/^$/d')"
+
+  if [ -n "$license" ]; then
+    [ -f "$license" ] || die "license file not found: $license"
+    cp "$license" "$INST_DIR/license.bclicense"; chmod 644 "$INST_DIR/license.bclicense"
+    BC_LICENSE_HOST_PATH="$INST_DIR/license.bclicense"; BC_LICENSE_FILE="/bc/custom-license.bclicense"
+  fi
+  BC_LICENSE_HOST_PATH="${BC_LICENSE_HOST_PATH:-}"; BC_LICENSE_FILE="${BC_LICENSE_FILE:-}"
+
+  # Port slot: keep the instance's own slot; otherwise first slot whose ports are all free.
+  local running; running=$(bc_health)
+  if [ -n "$slot" ]; then BCL_SLOT="$slot"
+  elif [ -z "${BCL_SLOT:-}" ]; then BCL_SLOT="$(pick_slot)"; fi
+  [[ "$BCL_SLOT" =~ ^[0-9]$ ]] || die "--slot must be 0-9"
+  slot_ports "$BCL_SLOT"
+  if [ "$running" = "absent" ] && ! slot_ports_free "$BCL_SLOT"; then
+    die "ports for slot $BCL_SLOT are busy (another process or a non-bcl BC stack?). Pick another: --slot N"
+  fi
+  BC_WEBCLIENT_PATHBASE="/BC"
+  if [ "$BCL_FRONTDOOR" = "1" ]; then BC_WEBCLIENT_PUBLIC_URL="http://localhost:$BCL_FRONT_PORT/BC/"; else BC_WEBCLIENT_PUBLIC_URL="http://localhost:$BC_WEBCLIENT_PORT/BC/"; fi
+
+  preflight_resources "$force" "$running"
+  ensure_artifacts "$refresh"
+  if [ -n "$BCL_SNAPSHOT" ]; then
+    local snapver; snapver=$(snapshot_meta "$BCL_SNAPSHOT_DIR/$BCL_SNAPSHOT.json" bc_version)
+    if [ -n "$snapver" ] && [ "$snapver" != "$(artifact_version "$BC_ARTIFACTS_DIR")" ] && [ "$force" != "1" ]; then
+      die "snapshot '$BCL_SNAPSHOT' was taken on BC $snapver but the artifacts are now $(artifact_version "$BC_ARTIFACTS_DIR") (--refresh moved the build?). Re-create the snapshot or pass --force"
+    fi
+  fi
+
+  write_instance_env
+  write_aux_files
+  local new_env; new_env=$(grep -v '^#' "$INST_DIR/instance.env")
+  if [ -n "$old_env" ] && [ "$old_env" != "$new_env" ] && [ "$running" != "absent" ]; then
+    if [ -n "$BCL_SNAPSHOT" ]; then warn "settings changed — recreating the stack; the database will be restored from snapshot '$BCL_SNAPSHOT':"
+    else warn "settings changed — recreating the stack; the database will be a fresh CRONUS:"; fi
+    diff <(echo "$old_env") <(echo "$new_env") | grep -E '^[<>]' | grep -viE 'PASSWORD' | sed 's/^/    /' >&2 || true
+    # Full down (volumes kept) so the outcome never depends on which container compose
+    # happens to recreate: a recreated bc on a surviving sql would boot the OLD database.
+    compose down --remove-orphans >&2 || true
+    running="absent"
+  fi
+
+  ensure_image "$BC_RUNNER_IMAGE"; ensure_image "$BC_SQL_IMAGE"
+  [ "$BCL_FRONTDOOR" = "1" ] && ensure_image "$BCL_FRONTDOOR_IMAGE"
+
+  local services=(sql bc); [ "$BCL_FRONTDOOR" = "1" ] && services+=(frontdoor)
+  # Restore only when asked explicitly (reset to the snapshot) or when BC is not up —
+  # a plain `bcl up` on a healthy snapshot instance must stay a no-op.
+  if [ -n "$BCL_SNAPSHOT" ] && { [ -n "$snapshot" ] || [ "$running" != "running/healthy" ]; }; then
+    # The database must be in place BEFORE the bc entrypoint looks for it; it then
+    # logs "CRONUS already exists" and boots NST on our restored tenant.
+    if [ -n "$(container_id bc)" ]; then log "stopping bc so the database can be replaced ..."; compose rm -sf bc >/dev/null 2>&1 || true; fi
+    compose up -d --remove-orphans sql >&2 || die "docker compose up sql failed"
+    wait_sql_healthy 180
+    restore_snapshot "$BCL_SNAPSHOT"
+  fi
+  log "starting compose project bcl-$BCL_NAME (${services[*]}) ..."
+  compose up -d --remove-orphans "${services[@]}" >&2 || die "docker compose up failed"
+  if [ "$BCL_FRONTDOOR" != "1" ] && [ -n "$(container_id frontdoor)" ]; then compose rm -sf frontdoor >/dev/null 2>&1 || true; fi
+  if [ "$nowait" = "1" ]; then
+    ok "started in background — wait with: bcl wait${BCL_NAME:+ --name $BCL_NAME}"
+    return 0
+  fi
+  wait_ready "$timeout"
+  [ -n "$BCL_SNAPSHOT" ] && ensure_snapshot_keys "$BCL_SNAPSHOT"
+  print_summary
+}
+
+preflight_resources() {  # $1 force, $2 current state
+  docker info >/dev/null 2>&1 || die "docker daemon not reachable (is this an sbx sandbox with Docker? try: docker info)"
+  [ "$2" != "absent" ] && return 0     # already running: nothing new to allocate
+  local avail_mb root free_mb
+  avail_mb=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+  if [ "$avail_mb" -lt 5000 ] && [ "$1" != "1" ]; then
+    die "only ${avail_mb} MB RAM available; one BC instance needs ~6-8 GB (NST 3.5-6 GB + SQL 2.4 GB + tmpfs data). Stop another instance or pass --force"
+  elif [ "$avail_mb" -lt 7500 ]; then
+    warn "only ${avail_mb} MB RAM available; one BC instance needs ~6-8 GB — expect swapless OOM kills under load"
+  fi
+  root=$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)
+  free_mb=$(df -Pm "$root" 2>/dev/null | awk 'NR==2{print $4}')
+  if [ -n "$free_mb" ] && [ "$free_mb" -lt 2500 ]; then
+    if [ "$1" != "1" ]; then die "only ${free_mb} MB free on the Docker disk ($root); a new instance needs ~2.5 GB (service tier + assembly cache volumes). Free space: bcl down --purge on old instances, docker image prune"; fi
+    warn "low Docker disk space: ${free_mb} MB"
+  fi
+}
+
+cmd_wait() {
+  local timeout=30
+  while [ $# -gt 0 ]; do case "$1" in --name) set_instance "$2"; shift 2 ;; --timeout) timeout="$2"; shift 2 ;; *) die "unknown option: $1" ;; esac; done
+  [ -n "$INST_DIR" ] || set_instance "$BCL_NAME"
+  load_instance
+  [ "$(bc_health)" = "absent" ] && die "instance '$BCL_NAME' is not running — start it: bcl up --name $BCL_NAME"
+  wait_ready "$timeout"
+  print_summary
+}
+
+cmd_status() {
+  local json=0
+  while [ $# -gt 0 ]; do case "$1" in --name) set_instance "$2"; shift 2 ;; --json) json=1; shift ;; *) die "unknown option: $1" ;; esac; done
+  [ -n "$INST_DIR" ] || set_instance "$BCL_NAME"
+  load_instance; urls
+  local st dev odata web ver
+  st=$(bc_health)
+  dev=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -u "$AUTH" "$DEV_URL/metadata" 2>/dev/null || true)
+  odata=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -u "$AUTH" "$ODATA_URL/Company" 2>/dev/null || true)
+  web="-"; [ -n "$WEB_URL" ] && web=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$WEB_URL" 2>/dev/null || true)
+  ver=$(artifact_version "$BC_ARTIFACTS_DIR")
+  if [ "$json" = "1" ]; then
+    python3 - "$BCL_NAME" "$st" "$dev" "$odata" "$web" "$ver" "$DEV_URL" "$ODATA_URL" "$API_URL" "$FRONT_URL" "$WEB_URL" "$INST_DIR/launch.json" "$LAUNCH_NAME" "$BC_SERVER_USERNAME" "$BCL_SLOT" <<'PY'
+import json, sys
+k = ["name","state","dev_http","odata_http","web_http","bc_version","dev_url","odata_url","api_url","front_url","web_url","launch_json","launch_name","username","slot"]
+print(json.dumps(dict(zip(k, sys.argv[1:])), indent=2))
+PY
+    return 0
+  fi
+  echo "${C_B}instance${C_0}  $BCL_NAME   (compose project bcl-$BCL_NAME, slot $BCL_SLOT)"
+  echo "${C_B}state${C_0}     $st"
+  echo "${C_B}BC${C_0}        $ver   [$BC_TYPE $BC_VERSION $BC_COUNTRY]"
+  echo "${C_B}upstream${C_0}  ${BCL_REF:0:12}  image ${BC_RUNNER_IMAGE##*/}  sql ${BC_SQL_IMAGE##*/}"
+  echo "${C_B}probes${C_0}    dev=$dev odata=$odata web=$web   (dev 401/200 and odata 200 = serving)"
+  echo "${C_B}urls${C_0}      dev $DEV_URL | odata $ODATA_URL | api $API_URL${FRONT_URL:+ | front $FRONT_URL}${WEB_URL:+ | web $WEB_URL}"
+  echo "${C_B}login${C_0}     $BC_SERVER_USERNAME / $BC_SERVER_PASSWORD"
+  if [ -n "${BCL_SNAPSHOT:-}" ]; then echo "${C_B}database${C_0}  boots from snapshot '$BCL_SNAPSHOT'"; else echo "${C_B}database${C_0}  fresh CRONUS on every boot (ephemeral)"; fi
+  echo "${C_B}launch${C_0}    $INST_DIR/launch.json  ($LAUNCH_NAME)"
+  local ids; ids=$(docker ps -q --filter "label=com.docker.compose.project=bcl-$BCL_NAME")
+  # shellcheck disable=SC2086
+  [ -n "$ids" ] && docker stats --no-stream --format '          {{.Name}}  cpu {{.CPUPerc}}  mem {{.MemUsage}}' $ids
+  return 0
+}
+
+cmd_ls() {
+  local f n st
+  printf '%-12s %-4s %-18s %-20s %-26s %s\n' NAME SLOT "BC (requested)" STATE "DATABASE ON BOOT" "URL (front door)"
+  for f in "$BCL_HOME"/instances/*/instance.env; do
+    [ -f "$f" ] || continue
+    n=$(basename "$(dirname "$f")")
+    (
+      set_instance "$n"; load_instance
+      st=$(bc_health)
+      local db="fresh CRONUS"; [ -n "${BCL_SNAPSHOT:-}" ] && db="snapshot ${BCL_SNAPSHOT}"
+      case "${BC_SQL_IMAGE:-}" in *-fts) db="$db +fts" ;; esac
+      local url="http://localhost:${BCL_FRONT_PORT:-?}/BC"; [ "${BCL_FRONTDOOR:-1}" = "1" ] || url="http://localhost:$BC_DEV_PORT/BC/dev"
+      printf '%-12s %-4s %-18s %-20s %-26s %s\n' "$n" "$BCL_SLOT" "$BC_TYPE $BC_VERSION $BC_COUNTRY" "$st" "$db" "$url"
+    )
+  done
+}
+
+cmd_logs() {
+  local tail=200 follow=() svc=bc
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) set_instance "$2"; shift 2 ;;
+      --tail|-n) tail="$2"; shift 2 ;;
+      -f|--follow) follow=(-f); shift ;;
+      bc|sql|frontdoor|webclient) svc="$1"; shift ;;
+      *) die "unknown option: $1 (bcl logs [bc|sql|frontdoor|webclient] [--tail N] [-f])" ;;
+    esac
+  done
+  [ -n "$INST_DIR" ] || set_instance "$BCL_NAME"
+  load_instance
+  if [ "$svc" = "webclient" ]; then
+    compose exec -T bc tail -n "$tail" "${follow[@]+"${follow[@]}"}" /tmp/webclient.log
+  else
+    compose logs --no-log-prefix --tail "$tail" "${follow[@]+"${follow[@]}"}" "$svc"
+  fi
+}
+
+cmd_down() {
+  local purge=0 all=0
+  while [ $# -gt 0 ]; do
+    case "$1" in --name) set_instance "$2"; shift 2 ;; --purge|-v) purge=1; shift ;; --all) all=1; shift ;; *) die "unknown option: $1" ;; esac
+  done
+  if [ "$all" = "1" ]; then
+    local f
+    for f in "$BCL_HOME"/instances/*/instance.env; do
+      [ -f "$f" ] || continue
+      ( set_instance "$(basename "$(dirname "$f")")"; if [ "$purge" = 1 ]; then cmd_down --name "$BCL_NAME" --purge; else cmd_down --name "$BCL_NAME"; fi )
+    done
+    return 0
+  fi
+  [ -n "$INST_DIR" ] || set_instance "$BCL_NAME"
+  instance_exists || { log "instance '$BCL_NAME' does not exist — nothing to do"; return 0; }
+  load_instance
+  with_lock
+  if [ "$purge" = "1" ]; then
+    log "removing bcl-$BCL_NAME containers + volumes (service tier, assembly cache); artifacts are kept ..."
+    compose down --remove-orphans -v >&2
+    rm -rf "$INST_DIR"
+    ok "instance '$BCL_NAME' purged"
+  else
+    log "stopping bcl-$BCL_NAME (volumes kept → next bcl up is a warm boot) ..."
+    compose down --remove-orphans >&2
+    ok "instance '$BCL_NAME' stopped"
+  fi
+}
+
+cmd_restart() {
+  local hard=0 timeout=300
+  while [ $# -gt 0 ]; do case "$1" in --name) set_instance "$2"; shift 2 ;; --hard) hard=1; shift ;; --timeout) timeout="$2"; shift 2 ;; *) die "unknown option: $1" ;; esac; done
+  [ -n "$INST_DIR" ] || set_instance "$BCL_NAME"
+  load_instance
+  if [ "$hard" = "1" ]; then
+    log "hard restart: recreating containers (database will be reset) ..."
+    compose down --remove-orphans >&2
+    cmd_up --name "$BCL_NAME"
+    return
+  fi
+  [ "$(bc_health)" = "running/healthy" ] || die "instance is not healthy ($(bc_health)); use: bcl restart --hard"
+  log "soft restart of the service tier (NST only — database and published apps are kept) ..."
+  compose exec -T bc /bc/scripts/restart-service.sh "$timeout" >&2 || die "soft restart failed — try: bcl restart --hard"
+  wait_ready 10
+}
+
+publish_one() {  # $1 app, $2 sync mode, $3 timeout s
+  local app="$1" mode="$2" tmo="$3" body code t0
+  [ -f "$app" ] || die "app not found: $app"
+  body=$(mktemp)
+  t0=$(now)
+  log "publishing $(basename "$app") ($(du -h "$app" | cut -f1)) SchemaUpdateMode=$mode ..."
+  code=$(curl -s -o "$body" -w '%{http_code}' --max-time "$tmo" -u "$AUTH" -X POST \
+    -F "file=@${app};type=application/octet-stream" \
+    "$DEV_URL/apps?tenant=default&SchemaUpdateMode=$mode" 2>/dev/null || true)
+  if [ "$code" = "200" ] || [ "$code" = "204" ]; then
+    rm -f "$body"; ok "published $(basename "$app") in $(( $(now) - t0 ))s"; return 0
+  fi
+  # 422 can be benign (identical package already there) — but only if BC didn't roll back.
+  if [ "$code" = "422" ] && grep -qiE "already (deployed|installed|published|exists)|duplicate package" "$body" \
+     && ! grep -qiE "publishing failed|could not install the extension|original extensions have been restored" "$body"; then
+    rm -f "$body"; ok "$(basename "$app") already published at this version (HTTP 422, benign) — bump the version to republish changed code"; return 0
+  fi
+  echo "" >&2
+  printf '[bcl] %sERROR%s publish of %s failed: HTTP %s after %ss\n' "$C_R" "$C_0" "$(basename "$app")" "${code:-000}" "$(( $(now) - t0 ))" >&2
+  sed 's/^/    /' "$body" | head -60 >&2; echo "" >&2
+  if grep -qi "Full-Text Search component is not installed" "$body"; then
+    echo "    CAUSE: the app uses OptimizeForTextSearch; the default SQL image has no full-text search." >&2
+    echo "    FIX:   bcl up --name $BCL_NAME --fts     (recreates SQL; database resets)" >&2
+  elif [ "$code" = "000" ]; then
+    echo "    No HTTP response: BC is down or the publish exceeded --timeout ${tmo}s. Check: bcl status; bcl logs --tail 100" >&2
+  elif [ "$code" = "401" ]; then
+    echo "    Unauthorized: wrong credentials for this instance (see bcl status)." >&2
+  fi
+  rm -f "$body"
+  return 1
+}
+
+cmd_publish() {
+  local mode="ForceSync" tmo=1800 apps=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) set_instance "$2"; shift 2 ;;
+      --sync-mode) mode="$2"; shift 2 ;;
+      --timeout) tmo="$2"; shift 2 ;;
+      -*) die "unknown option: $1" ;;
+      *) apps+=("$1"); shift ;;
+    esac
+  done
+  [ ${#apps[@]} -gt 0 ] || die "usage: bcl publish [--name N] [--sync-mode ForceSync|Synchronize|Recreate] <app> [<app>...]   (dependency order!)"
+  [ -n "$INST_DIR" ] || set_instance "$BCL_NAME"
+  load_instance; urls
+  [ "$(bc_health)" = "running/healthy" ] || die "instance '$BCL_NAME' is not healthy ($(bc_health)) — bcl up / bcl wait first"
+  local a
+  for a in "${apps[@]}"; do publish_one "$a" "$mode" "$tmo" || exit 1; done
+}
+
+cmd_apps() {
+  local all=0
+  while [ $# -gt 0 ]; do case "$1" in --name) set_instance "$2"; shift 2 ;; --all) all=1; shift ;; *) die "unknown option: $1" ;; esac; done
+  [ -n "$INST_DIR" ] || set_instance "$BCL_NAME"
+  load_instance
+  local where="WHERE pa.[Publisher] <> 'Microsoft'"; [ "$all" = "1" ] && where=""
+  sql_query "SET NOCOUNT ON;
+SELECT LEFT(pa.[Name],45) AS Name, LEFT(pa.[Publisher],20) AS Publisher,
+  CONCAT(pa.[Version Major],'.',pa.[Version Minor],'.',pa.[Version Build],'.',pa.[Version Revision]) AS Version,
+  CASE WHEN EXISTS (SELECT 1 FROM [NAV App Installed App] i WHERE i.[Package ID] = pa.[Package ID]) THEN 'installed' ELSE 'published-only' END AS State
+FROM [Published Application] pa $where ORDER BY pa.[Publisher], pa.[Name];
+SELECT COUNT(*) AS [published apps total] FROM [Published Application];"
+}
+
+sql_query() {  # $1 = T-SQL against the BC database (human-readable output)
+  compose exec -T sql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$SA_PASSWORD" -C -No -d "$BC_DATABASE" -W -s ' | ' -Q "$1"
+}
+sql_raw() {  # $1 = database, $2 = T-SQL; tab-separated, no headers, fails on SQL errors
+  compose exec -T sql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$SA_PASSWORD" -C -No -b -d "$1" -h -1 -W -s $'\t' -Q "$2"
+}
+
+wait_sql_healthy() {  # $1 = timeout s
+  local t0 cid st; t0=$(now)
+  while :; do
+    cid=$(container_id sql)
+    st=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$cid" 2>/dev/null || true)
+    [ "$st" = "healthy" ] && return 0
+    [ $(( $(now) - t0 )) -ge "$1" ] && die "sql container not healthy after ${1}s (state '$st'): bcl logs sql"
+    sleep 2
+  done
+}
+
+snapshot_meta() {  # $1 = meta json, $2 = key
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2],""))' "$1" "$2" 2>/dev/null || true
+}
+
+restore_snapshot() {  # $1 = label; bc must be stopped, sql healthy
+  local label="$1" fl d l t0; t0=$(now)
+  log "restoring database snapshot '$label' ($(du -h "$BCL_SNAPSHOT_DIR/$label.bak" | cut -f1)) ..."
+  fl=$(sql_raw master "SET NOCOUNT ON; RESTORE FILELISTONLY FROM DISK='/bcl-snapshots/$label.bak'") \
+    || die "cannot read /bcl-snapshots/$label.bak inside the sql container (is the snapshot dir mounted? recreate with bcl up)"
+  d=$(printf '%s\n' "$fl" | sed -n 1p | cut -f1); l=$(printf '%s\n' "$fl" | sed -n 2p | cut -f1)
+  [ -n "$d" ] && [ -n "$l" ] || die "unexpected RESTORE FILELISTONLY output: $fl"
+  sql_raw master "IF DB_ID('$BC_DATABASE') IS NOT NULL ALTER DATABASE [$BC_DATABASE] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+RESTORE DATABASE [$BC_DATABASE] FROM DISK='/bcl-snapshots/$label.bak'
+  WITH MOVE '$d' TO '/var/opt/mssql/data/$BC_DATABASE.mdf', MOVE '$l' TO '/var/opt/mssql/data/${BC_DATABASE}_log.ldf', REPLACE;
+ALTER DATABASE [$BC_DATABASE] SET MULTI_USER;" >/dev/null || die "RESTORE DATABASE from snapshot '$label' failed"
+  ok "database restored from '$label' in $(( $(now) - t0 ))s"
+}
+
+ensure_snapshot_keys() {  # copy the tenant encryption key the snapshot's DB refers to, if this volume lacks it
+  local kd="$BCL_SNAPSHOT_DIR/$1.keys" f copied=0 cid
+  [ -d "$kd" ] || return 0
+  cid=$(container_id bc)
+  for f in "$kd"/*.key; do
+    [ -f "$f" ] || continue
+    if ! compose exec -T bc test -f "/bc/service/Keys/$(basename "$f")" 2>/dev/null; then
+      docker cp "$f" "$cid:/bc/service/Keys/$(basename "$f")" >/dev/null && copied=1
+    fi
+  done
+  if [ "$copied" = "1" ]; then
+    log "restored the snapshot's encryption key into this instance — restarting the service tier to load it ..."
+    compose exec -T bc /bc/scripts/restart-service.sh 300 >&2 || warn "service tier restart failed; AL encryption may be unavailable until: bcl restart"
+    wait_ready 10
+  fi
+  return 0
+}
+
+snapshot_save() {
+  local label="" force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in --name) set_instance "$2"; shift 2 ;; --force) force=1; shift ;; -*) die "unknown option: $1" ;; *) label="$1"; shift ;; esac
+  done
+  [[ "$label" =~ ^[a-z0-9][a-z0-9._-]{0,40}$ ]] || die "usage: bcl snapshot save <label> [--name N] [--force]   (label: lowercase, digits, . _ -)"
+  [ -n "$INST_DIR" ] || set_instance "$BCL_NAME"
+  load_instance; urls
+  [ "$(bc_health)" = "running/healthy" ] || die "instance '$BCL_NAME' is not healthy — nothing consistent to snapshot"
+  BCL_SNAPSHOT_DIR="${BCL_SNAPSHOT_DIR:-$BCL_HOME/snapshots/$(basename "$BC_ARTIFACTS_DIR")}"
+  mkdir -p "$BCL_SNAPSHOT_DIR"; chmod 0777 "$BCL_SNAPSHOT_DIR"
+  local bak="$BCL_SNAPSHOT_DIR/$label.bak" t0 target mounted=1; t0=$(now)
+  [ -e "$bak" ] && [ "$force" != "1" ] && die "snapshot '$label' already exists for $(basename "$BC_ARTIFACTS_DIR") — pass --force to overwrite"
+  compose exec -T sql test -w /bcl-snapshots 2>/dev/null || mounted=0
+  if [ "$mounted" = "1" ]; then target="/bcl-snapshots/$label.bak.tmp"; else target="/var/opt/mssql/data/bcl-snapshot.bak"; fi
+  log "backing up $BC_DATABASE (COPY_ONLY, compressed) ..."
+  sql_raw master "BACKUP DATABASE [$BC_DATABASE] TO DISK='$target' WITH COPY_ONLY, INIT, FORMAT, COMPRESSION, CHECKSUM" >/dev/null \
+    || die "BACKUP DATABASE failed"
+  if [ "$mounted" = "1" ]; then
+    mv -f "$bak.tmp" "$bak" || die "could not move the backup into place ($bak)"
+  else
+    # Instance created before snapshot support (no /bcl-snapshots mount). The data
+    # dir is a tmpfs, which `docker cp` cannot read — stream it out instead.
+    warn "this instance has no snapshot mount (created by an older bcl); streaming the backup out of the container"
+    if ! compose exec -T sql cat "$target" > "$bak.tmp"; then rm -f "$bak.tmp"; die "could not copy the backup out of the sql container"; fi
+    compose exec -T sql rm -f "$target" >/dev/null 2>&1 || true
+    [ -s "$bak.tmp" ] || { rm -f "$bak.tmp"; die "backup came out empty"; }
+    mv -f "$bak.tmp" "$bak"
+  fi
+  chmod 0644 "$bak" 2>/dev/null || true
+  rm -rf "$BCL_SNAPSHOT_DIR/$label.keys"; mkdir -p "$BCL_SNAPSHOT_DIR/$label.keys"
+  docker cp "$(container_id bc):/bc/service/Keys/." "$BCL_SNAPSHOT_DIR/$label.keys/" >/dev/null 2>&1 || warn "could not copy encryption keys (AL encryption may fail after restoring elsewhere)"
+  local apps
+  apps=$(sql_raw "$BC_DATABASE" "SET NOCOUNT ON; SELECT pa.[Name], pa.[Publisher], CONCAT(pa.[Version Major],'.',pa.[Version Minor],'.',pa.[Version Build],'.',pa.[Version Revision]) FROM [Published Application] pa WHERE pa.[Publisher] <> 'Microsoft' AND EXISTS (SELECT 1 FROM [NAV App Installed App] i WHERE i.[Package ID] = pa.[Package ID]) ORDER BY pa.[Name]" || true)
+  python3 - "$BCL_SNAPSHOT_DIR/$label.json" "$label" "$BCL_NAME" "$(artifact_version "$BC_ARTIFACTS_DIR")" "$(basename "$BC_ARTIFACTS_DIR")" \
+           "$BC_RUNNER_IMAGE" "$BC_SQL_IMAGE" "$BC_DATABASE" "$(stat -c %s "$bak")" "$apps" <<'PY'
+import json, sys, datetime
+f, label, inst, ver, art, img, sql, db, size, apps = sys.argv[1:]
+rows = [dict(zip(("name", "publisher", "version"), l.split("\t"))) for l in apps.splitlines() if l.strip()]
+json.dump({"label": label, "created": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+           "instance": inst, "bc_version": ver, "artifacts": art, "runner_image": img, "sql_image": sql,
+           "database": db, "size_bytes": int(size), "apps": rows}, open(f, "w"), indent=2)
+PY
+  ok "snapshot '$label' saved in $(( $(now) - t0 ))s ($(du -h "$bak" | cut -f1)) with $(printf '%s\n' "$apps" | grep -c . || true) non-Microsoft app(s)"
+  log "boot into it (any instance on $(basename "$BC_ARTIFACTS_DIR")): bcl up --name $BCL_NAME --snapshot $label"
+}
+
+snapshot_ls() {
+  python3 - "$BCL_HOME/snapshots" <<'PY'
+import glob, json, os, sys
+rows = []
+for f in sorted(glob.glob(os.path.join(sys.argv[1], "*", "*.json"))):
+    try: m = json.load(open(f))
+    except Exception: continue
+    apps = ", ".join(f"{a['name']} {a['version']}" for a in m.get("apps", [])) or "-"
+    rows.append((m.get("label",""), m.get("artifacts",""), m.get("bc_version","").split(" ")[0], f"{m.get('size_bytes',0)/1048576:.0f}M", m.get("created","")[:16], apps))
+if not rows:
+    print("no snapshots — create one from a healthy instance: bcl snapshot save <label>"); sys.exit(0)
+print(f"{'LABEL':18} {'ARTIFACTS':22} {'BC':18} {'SIZE':6} {'CREATED':16}  APPS")
+for r in rows: print(f"{r[0]:18} {r[1]:22} {r[2]:18} {r[3]:6} {r[4]:16}  {r[5]}")
+PY
+}
+
+snapshot_rm() {
+  local label="" art=""
+  while [ $# -gt 0 ]; do case "$1" in --name) set_instance "$2"; shift 2 ;; --artifacts) art="$2"; shift 2 ;; -*) die "unknown option: $1" ;; *) label="$1"; shift ;; esac; done
+  [[ "$label" =~ ^[a-z0-9][a-z0-9._-]{0,40}$ ]] || die "usage: bcl snapshot rm <label> [--name N | --artifacts KEY]"
+  if [ -z "$art" ]; then [ -n "$INST_DIR" ] || set_instance "$BCL_NAME"; load_instance; art=$(basename "$BC_ARTIFACTS_DIR"); fi
+  local d="$BCL_HOME/snapshots/$art"
+  [ -f "$d/$label.bak" ] || die "no snapshot '$label' under $art (bcl snapshot ls)"
+  rm -rf "${d:?}/$label.bak" "${d:?}/$label.json" "${d:?}/$label.keys"
+  ok "snapshot '$label' ($art) removed"
+}
+
+cmd_snapshot() {
+  local sub="${1:-ls}"; shift || true
+  case "$sub" in
+    save) snapshot_save "$@" ;;
+    ls|list) snapshot_ls ;;
+    rm|delete) snapshot_rm "$@" ;;
+    restore)
+      [ $# -ge 1 ] || die "usage: bcl snapshot restore <label> [--name N]   (= bcl up --snapshot <label>)"
+      local l="$1"; shift; cmd_up --snapshot "$l" "$@" ;;
+    *) die "usage: bcl snapshot [save <label> | ls | rm <label> | restore <label>]" ;;
+  esac
+}
+
+cmd_sql() {
+  while [ $# -gt 0 ]; do case "$1" in --name) set_instance "$2"; shift 2 ;; *) break ;; esac; done
+  [ $# -ge 1 ] || die "usage: bcl sql [--name N] \"<T-SQL>\""
+  [ -n "$INST_DIR" ] || set_instance "$BCL_NAME"
+  load_instance
+  sql_query "$*"
+}
+
+cmd_exec() {
+  while [ $# -gt 0 ]; do case "$1" in --name) set_instance "$2"; shift 2 ;; --) shift; break ;; *) break ;; esac; done
+  [ -n "$INST_DIR" ] || set_instance "$BCL_NAME"
+  load_instance
+  [ $# -gt 0 ] || set -- bash
+  if [ -t 0 ]; then compose exec bc "$@"; else compose exec -T bc "$@"; fi
+}
+
+cmd_symbols() {
+  local appjsons=() out="" extras=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) set_instance "$2"; shift 2 ;;
+      --app-json) appjsons+=("$2"); shift 2 ;;
+      --out) out="$2"; shift 2 ;;
+      --extra) extras+=("$2"); shift 2 ;;
+      *) die "unknown option: $1 (bcl symbols --app-json <app.json> [--out dir] [--extra my.app])" ;;
+    esac
+  done
+  [ ${#appjsons[@]} -gt 0 ] || die "usage: bcl symbols --app-json <app.json> [--app-json ...] [--out <dir>] [--extra <dependency.app> ...]"
+  [ -n "$INST_DIR" ] || set_instance "$BCL_NAME"
+  load_instance
+  artifacts_ready "$BC_ARTIFACTS_DIR" || die "artifacts for instance '$BCL_NAME' are missing — run: bcl up --name $BCL_NAME"
+  [ -n "$out" ] || out="$(cd "$(dirname "${appjsons[0]}")" && pwd)/.alpackages"
+  mkdir -p "$out"
+  local args=() j rc=0
+  for j in "${appjsons[@]}"; do [ -f "$j" ] || die "not found: $j"; args+=(--app-json "$j"); done
+  log "staging symbols from the instance's artifacts ($(artifact_version "$BC_ARTIFACTS_DIR")) into $out ..."
+  python3 "$BCL_UPSTREAM_DIR/scripts/stage-symbols.py" "${args[@]}" --artifact-dir "$BC_ARTIFACTS_DIR" --out-dir "$out" >&2 || rc=$?
+  local e
+  for e in "${extras[@]+"${extras[@]}"}"; do [ -f "$e" ] || die "not found: $e"; cp -f "$e" "$out/"; log "added $(basename "$e")"; done
+  if [ "$rc" = "2" ]; then
+    # Dependencies that are not Microsoft's (e.g. your own base app) and were not given via
+    # --extra: if this instance is running and has them installed — typically from a
+    # snapshot — download their symbols from its dev endpoint instead of recompiling them.
+    if [ "$(bc_health)" = "running/healthy" ]; then
+      urls
+      if python3 - "$BCL_UPSTREAM_DIR/scripts" "$out" "$DEV_URL" "$AUTH" "${appjsons[@]}" <<'PY'
+import base64, json, os, sys, urllib.parse, urllib.request
+sys.path.insert(0, sys.argv[1]); import _bcapp
+out, dev, auth, appjsons = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:]
+have = set()
+for f in os.listdir(out):
+    if f.endswith(".app"):
+        info = _bcapp.read_app_info(os.path.join(out, f)) or {}
+        if info.get("id"): have.add(info["id"].lower())
+own = {json.load(open(j, encoding="utf-8-sig")).get("id", "").lower() for j in appjsons}
+missing = []
+for j in appjsons:
+    for d in json.load(open(j, encoding="utf-8-sig")).get("dependencies", []):
+        i = (d.get("id") or d.get("appId") or "").lower()
+        if i and i not in have and i not in own and i not in {m["id"] for m in missing}:
+            missing.append({"id": i, "name": d.get("name", ""), "publisher": d.get("publisher", ""), "version": d.get("version", "0.0.0.0")})
+hdr = {"Authorization": "Basic " + base64.b64encode(auth.encode()).decode()}
+bad = 0
+for m in missing:
+    q = urllib.parse.urlencode({"publisher": m["publisher"], "appName": m["name"], "appVersion": m["version"], "tenant": "default"})
+    try:
+        data = urllib.request.urlopen(urllib.request.Request(f"{dev}/packages?{q}", headers=hdr), timeout=300).read()
+    except Exception as e:
+        print(f"[bcl] could not download {m['publisher']} {m['name']} from the server: {e}", file=sys.stderr); bad += 1; continue
+    fn = f"{m['publisher']}_{m['name']}_server.app".replace("/", "_")
+    open(os.path.join(out, fn), "wb").write(data)
+    print(f"[bcl] OK downloaded symbols of {m['publisher']} {m['name']} from the running server ({len(data) // 1024} KB)", file=sys.stderr)
+sys.exit(1 if bad else 0)
+PY
+      then rc=0; fi
+    fi
+  fi
+  case "$rc" in
+    0) ok "symbols staged ($(find "$out" -maxdepth 1 -name '*.app' | wc -l) apps in $out)" ;;
+    2) if [ ${#extras[@]} -gt 0 ] && [ "$(bc_health)" != "running/healthy" ]; then log "dependencies outside the BC artifacts (listed above) are expected to come from --extra: $(for e in "${extras[@]}"; do printf '%s ' "$(basename "$e")"; done)"
+       else warn "some dependencies are not in the BC artifacts (listed above). Expected for your OWN apps: pass them with --extra <their .app> or copy them into $out"; fi ;;
+    *) die "stage-symbols failed (rc=$rc)" ;;
+  esac
+}
+
+instance_major() {  # BC major of the loaded instance's artifacts (platform version)
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["platform"].split(".")[0])' "$BC_ARTIFACTS_DIR/app/manifest.json" 2>/dev/null
+}
+
+stamp_app_jsons() {  # $1 = dir, $2 = BC major — target every app.json under dir at that major
+  python3 - "$1" "$2" <<'PY'
+import json, os, re, sys
+root, m = sys.argv[1], int(sys.argv[2])
+for dp, dns, fns in os.walk(root):
+    dns[:] = [d for d in dns if d not in (".alpackages", ".alcache", ".snapshots", ".git", "node_modules")]
+    if "app.json" not in fns:
+        continue
+    p = os.path.join(dp, "app.json")
+    raw = open(p, encoding="utf-8-sig").read()
+    a = json.loads(raw)
+    a["platform"] = f"{m}.0.0.0"
+    if "application" in a:
+        a["application"] = f"{m}.0.0.0"
+    a["runtime"] = f"{m - 11}.0"
+    if isinstance(a.get("preprocessorSymbols"), list):
+        keep = [s for s in a["preprocessorSymbols"] if not re.fullmatch(r"BC\d+", str(s))]
+        a["preprocessorSymbols"] = keep + [f"BC{m}", f"BC{m}00"]
+    json.dump(a, open(p, "w", encoding="utf-8"), indent=2)
+    print(f"[bcl] stamped {os.path.relpath(p, root)} for BC{m} (platform/application {m}.0.0.0, runtime {m - 11}.0)", file=sys.stderr)
+PY
+}
+
+cmd_workcopy() {
+  # Sandbox-local copy of an AL repo's CURRENT working tree (committed + uncommitted +
+  # untracked), stamped for the instance's BC version. Exists because the repo usually
+  # lives on the Windows host mount: bumping app.json there breaks the user's VS Code,
+  # and reading ~8k small files over virtiofs takes minutes. So: `git archive HEAD`
+  # (packfiles, fast) + overlay of only the files git reports as changed/untracked/deleted.
+  local repo="" paths=() label="" major="" stamp=1 aliases=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) set_instance "$2"; shift 2 ;;
+      --as) label="$2"; shift 2 ;;
+      --version) major="${2%%.*}"; shift 2 ;;
+      --no-stamp) stamp=0; shift ;;
+      --alias) aliases+=("$2"); shift 2 ;;
+      -*) die "unknown option: $1" ;;
+      *) if [ -z "$repo" ]; then repo="$1"; else paths+=("$1"); fi; shift ;;
+    esac
+  done
+  [ -n "$repo" ] || die "usage: bcl workcopy <repo-dir> [<subdir> ...] [--as LABEL] [--name N | --version 28] [--alias LINK=TARGET] [--no-stamp]"
+  repo=$(cd "$repo" && pwd) || die "not a directory: $repo"
+  local top; top=$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null) || die "$repo is not inside a git repository (copy it with rsync instead)"
+  [ -n "$label" ] || label=$(basename "$top")
+  [[ "$label" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid --as label '$label'"
+  if [ "$stamp" = "1" ] && [ -z "$major" ]; then
+    [ -n "$INST_DIR" ] || set_instance "$BCL_NAME"
+    instance_exists || die "no instance '$BCL_NAME' to take the BC version from — pass --name N, --version <major> or --no-stamp"
+    load_instance
+    major=$(instance_major) || true
+    [ -n "$major" ] || die "cannot read the BC version of instance '$BCL_NAME' (artifacts missing?) — pass --version <major>"
+  fi
+  local rel=() p
+  for p in "${paths[@]+"${paths[@]}"}"; do
+    p=$(cd "$repo" && cd "$p" && pwd) || die "not a directory: $p"
+    if [ "$p" = "$top" ]; then rel+=("."); else rel+=("${p#"$top"/}"); fi
+  done
+  [ ${#rel[@]} -gt 0 ] || rel=(".")
+  local dest="$BCL_HOME/work/$label" stage t0; t0=$(now)
+  mkdir -p "$BCL_HOME/tmp" "$dest"
+  stage=$(mktemp -d "$BCL_HOME/tmp/workcopy.XXXXXX")
+  log "copying ${rel[*]} from $top (HEAD $(git -C "$top" rev-parse --short HEAD)) + uncommitted changes ..."
+  git -C "$top" archive --format=tar HEAD -- "${rel[@]}" | tar -x -C "$stage" || { rm -rf "$stage"; die "git archive failed"; }
+  local n_changed=0 n_deleted=0
+  # porcelain v1 -z: "XY path\0", renames/copies "XY new\0old\0"
+  while IFS= read -r -d '' entry; do
+    local xy="${entry:0:2}" f="${entry:3}"
+    case "$xy" in
+      R*) IFS= read -r -d '' _old || true; rm -f "$stage/$_old"; n_deleted=$((n_deleted + 1)) ;;   # rename: old path is gone
+      C*) IFS= read -r -d '' _old || true ;;
+    esac
+    if [ -e "$top/$f" ] || [ -L "$top/$f" ]; then
+      [ -d "$top/$f" ] && continue
+      mkdir -p "$stage/$(dirname "$f")"; cp -P "$top/$f" "$stage/$f"; n_changed=$((n_changed + 1))
+    else
+      rm -f "$stage/$f"; n_deleted=$((n_deleted + 1))
+    fi
+  done < <(git -C "$top" status --porcelain=v1 -z --untracked-files=all -- "${rel[@]}")
+  # Keep staged symbols/caches between refreshes; everything else mirrors the working tree.
+  rsync -a --delete --exclude '.alpackages/' --exclude '.alcache/' --exclude '.snapshots/' --exclude '*.app' "$stage/" "$dest/"
+  rm -rf "$stage"
+  [ "$stamp" = "1" ] && stamp_app_jsons "$dest" "$major"
+  local a
+  for a in "${aliases[@]+"${aliases[@]}"}"; do
+    [[ "$a" == *=* ]] || die "--alias expects LINK=TARGET (e.g. src/_ControlAddins=_ControlAddIns for a case-only path mismatch)"
+    mkdir -p "$dest/$(dirname "${a%%=*}")"; ln -sfn "${a#*=}" "$dest/${a%%=*}"
+  done
+  ok "work copy ready in $(( $(now) - t0 ))s: $dest ($n_changed changed/untracked, $n_deleted deleted vs HEAD${major:+, stamped BC$major})"
+  echo "$dest"
+}
+
+cmd_compile() {
+  # symbols (from the instance's artifacts = the exact build the server runs) + al compile.
+  # stdout: the path of the produced .app — use APP=$(bcl compile ...).
+  local proj="" extras=() out="" showwarn=0 jobs
+  jobs=$(nproc 2>/dev/null || echo 4); [ "$jobs" -gt 8 ] && jobs=8
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) set_instance "$2"; shift 2 ;;
+      --extra) extras+=("$2"); shift 2 ;;
+      --out) out="$2"; shift 2 ;;
+      --warnings) showwarn=1; shift ;;
+      -*) die "unknown option: $1" ;;
+      *) proj="$1"; shift ;;
+    esac
+  done
+  [ -n "$proj" ] && [ -f "$proj/app.json" ] || die "usage: bcl compile <project-dir with app.json> [--extra dependency.app ...] [--out file.app] [--name N]"
+  have al || die "the 'al' compiler is not on PATH (dotnet tool install -g Microsoft.Dynamics.BusinessCentral.Development.Tools --prerelease)"
+  proj=$(cd "$proj" && pwd)
+  [ -n "$INST_DIR" ] || set_instance "$BCL_NAME"
+  load_instance
+  local major appmaj
+  major=$(instance_major || true)
+  appmaj=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8-sig")).get("platform","0").split(".")[0])' "$proj/app.json" 2>/dev/null || echo 0)
+  if [ -n "$major" ] && [ "$appmaj" != "$major" ]; then
+    warn "app.json platform is $appmaj.x but instance '$BCL_NAME' runs BC$major — expect symbol errors. Stamp a work copy: bcl workcopy <repo> <dirs> --name $BCL_NAME"
+  fi
+  local e sym=(--app-json "$proj/app.json")
+  for e in "${extras[@]+"${extras[@]}"}"; do [ -f "$e" ] || die "not found: $e"; sym+=(--extra "$e"); done
+  ( cmd_symbols --name "$BCL_NAME" "${sym[@]}" ) || die "symbol staging failed"
+  if [ -z "$out" ]; then
+    local fn
+    fn=$(python3 - "$proj/app.json" <<'PY'
+import json, re, sys
+a = json.load(open(sys.argv[1], encoding="utf-8-sig"))
+print(re.sub(r"[^A-Za-z0-9._-]+", "_", "_".join([a.get("publisher", ""), a["name"], a.get("version", "")])) + ".app")
+PY
+)
+    out="$BCL_HOME/build/bc${major:-unknown}/$fn"   # per BC major: builds for different instances must not overwrite each other
+  fi
+  mkdir -p "$(dirname "$out")"; out="$(cd "$(dirname "$out")" && pwd)/$(basename "$out")"
+  rm -f "$out"
+  local logf t0 rc=0; logf=$(mktemp "$BCL_HOME/tmp/compile.XXXXXX.log"); t0=$(now)
+  log "compiling $(basename "$proj") → $out (parallel $jobs) ..."
+  al compile "/project:$proj" "/packagecachepath:$proj/.alpackages" "/out:$out" /parallel+ "/maxdegreeofparallelism:$jobs" > "$logf" 2>&1 || rc=$?
+  local nerr nwarn; nerr=$(grep -cE ': error ' "$logf" || true); nwarn=$(grep -cE ': warning ' "$logf" || true)
+  if [ "$rc" != "0" ] || [ "$nerr" != "0" ] || [ ! -s "$out" ]; then
+    grep -E ': error ' "$logf" | head -25 >&2 || tail -20 "$logf" >&2
+    [ "$nerr" -gt 25 ] && log "... $((nerr - 25)) more errors in $logf"
+    die "compile failed: $nerr error(s), rc=$rc (full log: $logf)"
+  fi
+  [ "$showwarn" = "1" ] && grep -E ': warning ' "$logf" | head -40 >&2
+  rm -f "$logf"
+  ok "compiled in $(( $(now) - t0 ))s: $(basename "$out") ($(du -h "$out" | cut -f1), $nwarn warning(s))"
+  echo "$out"
+}
+
+find_bcdev() {
+  if [ -n "${BCL_BCDEV:-}" ]; then [ -x "$BCL_BCDEV" ] && { echo "$BCL_BCDEV"; return; }; return 1; fi
+  if have bcdev; then command -v bcdev; return; fi
+  if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -x "$CLAUDE_PLUGIN_ROOT/bin/bcdev-ensure" ]; then echo "$CLAUDE_PLUGIN_ROOT/bin/bcdev-ensure"; return; fi
+  local c; c=$(ls -d "$HOME"/.claude/plugins/cache/*/bcdev-cli/*/bin/bcdev-ensure 2>/dev/null | sort -V | tail -1)
+  [ -n "$c" ] && { echo "$c"; return; }
+  return 1
+}
+
+cmd_test() {
+  local runner="websocket" app="" range="" junit="" company="" codeunit="" method="" timeout=30 srcdirs=() pass=() nopublish=0 transport=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) set_instance "$2"; shift 2 ;;
+      --runner) runner="$2"; shift 2 ;;
+      --app) app="$2"; shift 2 ;;
+      --codeunit-range) range="$2"; shift 2 ;;
+      --codeunit) codeunit="$2"; shift 2 ;;
+      --method) method="$2"; shift 2 ;;
+      --junit-output|--junit) junit="$2"; shift 2 ;;
+      --company) company="$2"; shift 2 ;;
+      --timeout) timeout="$2"; shift 2 ;;
+      --source-dir) srcdirs+=("$2"); shift 2 ;;
+      --transport) transport="$2"; shift 2 ;;
+      --no-publish) nopublish=1; shift ;;
+      --) shift; pass=("$@"); break ;;
+      *) die "unknown option: $1 (see: bcl help)" ;;
+    esac
+  done
+  [ -n "$INST_DIR" ] || set_instance "$BCL_NAME"
+  load_instance; urls
+  [ "$(bc_health)" = "running/healthy" ] || die "instance '$BCL_NAME' is not healthy ($(bc_health))"
+  [ -n "$codeunit" ] && [ -z "$range" ] && range="$codeunit"
+  if [ -n "$junit" ]; then mkdir -p "$(dirname "$junit")"; junit="$(cd "$(dirname "$junit")" && pwd)/$(basename "$junit")"; fi
+  [ -n "$app" ] && app="$(cd "$(dirname "$app")" && pwd)/$(basename "$app")"
+  # The front door serves OData AND /api on one origin; upstream's API fallback
+  # is hardcoded to :7052, which is wrong for any slot but 0.
+  local base="http://localhost:$BC_ODATA_PORT/BC"; [ -n "$FRONT_URL" ] && base="$FRONT_URL"
+  [ "${BCL_SLOT}" != "0" ] && [ -z "$FRONT_URL" ] && warn "slot $BCL_SLOT without front door: upstream run-tests.sh assumes the API on :7052 and may fail"
+
+  case "$runner" in
+    websocket)
+      [ -n "$app" ] || die "--app <test.app> is required (codeunits are discovered from its symbols; it is (re)published first)"
+      [ -n "$method" ] && warn "--method is not supported by the websocket runner; running the whole codeunit"
+      local args=(--app "$app" --base-url "$base" --dev-url "$DEV_URL" --auth "$AUTH" --timeout "$timeout")
+      [ -n "$range" ] && args+=(--codeunit-range "$range")
+      [ -n "$junit" ] && args+=(--junit-output "$junit")
+      [ -n "$company" ] && args+=(--company "$company")
+      in_instance_env bash -c 'cd "$BCL_UPSTREAM_DIR" && exec ./scripts/run-tests.sh "$@"' _ "${args[@]}" "${pass[@]+"${pass[@]}"}"
+      ;;
+    altool|hybrid)
+      [ -n "$app" ] || die "--app <test.app> is required"
+      have al || die "the 'al' dotnet tool is not on PATH (needs a build with 'al runtests', e.g. Microsoft.Dynamics.BusinessCentral.Development.Tools prerelease)"
+      al runtests --help >/dev/null 2>&1 || die "this 'al' has no 'runtests' command — install the prerelease AL tool"
+      local altool_cmd="al"   # al 30.x prints JSON by default; upstream parses the --raw text format
+      if al runtests --help 2>/dev/null | grep -q -- '--raw'; then
+        # Installed copy: the skill folder may come from a Windows share without exec bits.
+        mkdir -p "$BCL_HOME/bin"; cp -f "$SKILL_DIR/lib/al-raw" "$BCL_HOME/bin/al-raw"; chmod 0755 "$BCL_HOME/bin/al-raw"
+        altool_cmd="$BCL_HOME/bin/al-raw"
+      fi
+      # `al` caches server info next to its working directory; a stale cache once made an
+      # incompatible tool look compatible. Fresh, empty cwd for every bcl test run.
+      export BCL_AL_CWD="$BCL_HOME/tmp/al-cwd"; rm -rf "$BCL_AL_CWD"; mkdir -p "$BCL_AL_CWD"
+      if [ -z "$transport" ] || [ "$transport" = "cli" ]; then
+        # The cli transport needs an `al` that accepts this server. As of 2026-10 no public
+        # AL tool accepts BC 29's dev endpoint ("cannot be used with the specified server");
+        # the hub transport speaks to the same TestRunnerHub without `al`, so fall back to it.
+        local probe; probe=$(cd "$BCL_AL_CWD" && BC_SERVER_USERNAME="$BC_SERVER_USERNAME" BC_SERVER_PASSWORD="$BC_SERVER_PASSWORD" \
+          timeout 60 al runtests 1 --server http://localhost --serverinstance BC --port "$BC_DEV_PORT" --authentication UserPassword --environmenttype OnPrem 2>&1 || true)
+        if printf '%s' "$probe" | grep -q "cannot be used with the specified server"; then
+          warn "this 'al' ($(al --version 2>/dev/null | cut -d+ -f1)) cannot talk to this BC version's dev endpoint — using --transport hub (same TestRunnerHub, one session)"
+          transport="hub"
+        fi
+      fi
+      [ "$nopublish" = "1" ] || publish_one "$app" ForceSync 1800 || exit 1
+      local args=(--app "$app" --server http://localhost --server-instance BC --port "$BC_DEV_PORT" --api-port "$BC_API_PORT"
+                  --base-url "$base" --auth "$AUTH" --timeout "$timeout" --altool-cmd "$altool_cmd")
+      [ -n "$range" ] && args+=(--codeunit-range "$range")
+      [ -n "$junit" ] && args+=(--junit-output "$junit")
+      [ -n "$company" ] && args+=(--company "$company")
+      if [ "$runner" = "altool" ]; then
+        [ -n "$transport" ] && args+=(--transport "$transport")
+        in_instance_env bash -c 'cd "$BCL_UPSTREAM_DIR" && exec python3 -u scripts/run-tests-altool.py "$@"' _ "${args[@]}" "${pass[@]+"${pass[@]}"}"
+      else
+        local d; for d in "${srcdirs[@]+"${srcdirs[@]}"}"; do args+=(--al-source-dir "$(cd "$d" && pwd)"); done
+        args+=(--dev-url "$DEV_URL"); [ -n "$transport" ] && args+=(--altool-transport "$transport")
+        [ ${#srcdirs[@]} -eq 0 ] && warn "hybrid without --source-dir routes every codeunit to the websocket runner"
+        in_instance_env bash -c 'cd "$BCL_UPSTREAM_DIR" && exec python3 -u scripts/run-tests-hybrid.py "$@"' _ "${args[@]}" "${pass[@]+"${pass[@]}"}"
+      fi
+      ;;
+    bcdev)
+      [ -n "$FRONT_URL" ] || die "the bcdev runner needs the front door + web client (bcdev uses <server>:<port>/BC/cs). Recreate without --no-frontdoor"
+      [ "${BC_WEBCLIENT:-0}" = "1" ] || die "the bcdev runner needs the web client (client services /BC/cs): bcl up --name $BCL_NAME --webclient"
+      local bcdev; bcdev=$(find_bcdev) || die "bcdev not found: install the bcdev-cli Claude plugin, put bcdev on PATH, or set BCL_BCDEV=/path/to/bcdev"
+      if [ -n "$app" ] && [ "$nopublish" != "1" ]; then publish_one "$app" ForceSync 1800 || exit 1; fi
+      local args=(test -launchJsonPath "$INST_DIR/launch.json" -launchJsonName "$LAUNCH_NAME" -Username "$BC_SERVER_USERNAME" -Password "$BC_SERVER_PASSWORD" -timeoutMinutes "$timeout")
+      if [ -n "$codeunit" ]; then args+=(-CodeunitId "$codeunit"); [ -n "$method" ] && args+=(-MethodName "$method")
+      elif [ -n "$range" ]; then die "the bcdev runner takes --codeunit <id> [--method <name>] or runs everything; for ranges use --runner websocket"
+      else args+=(-all); fi
+      local outf; outf=$(mktemp)
+      "$bcdev" "${args[@]}" "${pass[@]+"${pass[@]}"}" | tee "$outf" >&2 || true
+      local rc=0
+      python3 - "$outf" "$junit" <<'PY' || rc=$?
+import json, re, sys, xml.sax.saxutils as su
+raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+start = raw.rfind('\n{"success"')
+if start < 0:
+    m = [i for i in range(len(raw)) if raw.startswith('{', i) and '"success"' in raw[i:i+40]]
+    start = m[-1] if m else -1
+try:
+    res = json.loads(raw[start:].strip()) if start >= 0 else None
+except Exception:
+    res = None
+if res is None:
+    print("[bcl] ERROR could not parse bcdev output", file=sys.stderr); sys.exit(1)
+print(f"{res.get('totalTests',0)} total, {res.get('passed',0)} passed, {res.get('failed',0)} failed, {res.get('skipped',0)} skipped", file=sys.stderr)
+if res.get("error"):
+    print("[bcl] bcdev error: " + str(res["error"])[:600], file=sys.stderr)
+if sys.argv[2]:
+    by = {}
+    for r in res.get("results", []):
+        by.setdefault(f"Codeunit {r.get('codeunitId')}", []).append(r)
+    out = ['<?xml version="1.0" encoding="utf-8"?>', f'<testsuites tests="{res.get("totalTests",0)}" failures="{res.get("failed",0)}">']
+    for suite, rs in by.items():
+        out.append(f'  <testsuite name="{su.escape(suite)}" tests="{len(rs)}" failures="{sum(1 for r in rs if r.get("result")=="Fail")}">')
+        for r in rs:
+            n = su.quoteattr(r.get("function", "")); c = su.quoteattr(suite)
+            if r.get("result") == "Fail":
+                out.append(f'    <testcase classname={c} name={n}><failure message={su.quoteattr(r.get("errorMessage",""))}>{su.escape(r.get("stackTrace","").replace(";", chr(10)))}</failure></testcase>')
+            elif r.get("result") == "Skip":
+                out.append(f'    <testcase classname={c} name={n}><skipped/></testcase>')
+            else:
+                out.append(f'    <testcase classname={c} name={n}/>')
+        out.append('  </testsuite>')
+    out.append('</testsuites>')
+    open(sys.argv[2], "w", encoding="utf-8").write("\n".join(out) + "\n")
+    print(f"[bcl] JUnit written to {sys.argv[2]}", file=sys.stderr)
+ok = res.get("success") is True and res.get("totalTests", 0) > 0
+sys.exit(0 if ok else 1)
+PY
+      rm -f "$outf"; return $rc
+      ;;
+    *) die "--runner must be websocket (default), altool, hybrid or bcdev" ;;
+  esac
+}
+
+cmd_env() {
+  while [ $# -gt 0 ]; do case "$1" in --name) set_instance "$2"; shift 2 ;; *) die "unknown option: $1" ;; esac; done
+  [ -n "$INST_DIR" ] || set_instance "$BCL_NAME"
+  load_instance
+  cat "$INST_DIR/connection.env"
+}
+
+cmd_launch_json() {
+  local merge=""
+  while [ $# -gt 0 ]; do case "$1" in --name) set_instance "$2"; shift 2 ;; --merge) merge="$2"; shift 2 ;; *) die "unknown option: $1" ;; esac; done
+  [ -n "$INST_DIR" ] || set_instance "$BCL_NAME"
+  load_instance; urls
+  if [ -z "$merge" ]; then
+    echo "# $INST_DIR/launch.json  (bcdev: -launchJsonPath \"$INST_DIR/launch.json\" -launchJsonName \"$LAUNCH_NAME\" -Username $BC_SERVER_USERNAME -Password '$BC_SERVER_PASSWORD')" >&2
+    cat "$INST_DIR/launch.json"; return 0
+  fi
+  python3 - "$INST_DIR/launch.json" "$merge" <<'PY'
+import json, os, re, sys
+src, dst = sys.argv[1], sys.argv[2]
+new = json.load(open(src))["configurations"]
+if os.path.exists(dst):
+    text = open(dst, encoding="utf-8-sig").read()
+    try:
+        cur = json.loads(text)
+    except json.JSONDecodeError:
+        # VS Code allows comments/trailing commas (JSONC); strip them conservatively.
+        t = re.sub(r'(?m)^\s*//.*$', '', text)
+        t = re.sub(r',(\s*[}\]])', r'\1', t)
+        cur = json.loads(t)
+        print(f"[bcl] note: {dst} had comments; they are not preserved", file=sys.stderr)
+else:
+    cur = {"version": "0.2.0", "configurations": []}
+names = {c["name"] for c in new}
+cur["configurations"] = [c for c in cur.get("configurations", []) if c.get("name") not in names] + new
+os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
+json.dump(cur, open(dst, "w", encoding="utf-8"), indent=4)
+print(f"[bcl] merged {sorted(names)} into {dst}", file=sys.stderr)
+PY
+}
+
+cmd_webclient() {
+  while [ $# -gt 0 ]; do case "$1" in --name) set_instance "$2"; shift 2 ;; *) die "unknown option: $1" ;; esac; done
+  [ -n "$INST_DIR" ] || set_instance "$BCL_NAME"
+  load_instance; urls
+  [ "${BC_WEBCLIENT:-0}" = "1" ] && { log "web client is managed by the container (BC_WEBCLIENT=1): $WEB_URL"; return 0; }
+  die "web client disabled for this instance — enable with: bcl up --name $BCL_NAME --webclient (recreates; DB resets)"
+}
+
+cmd_artifacts() {
+  local sub="${1:-ls}"; shift || true
+  case "$sub" in
+    ls)
+      local d
+      printf '%-36s %-8s %s\n' KEY SIZE "RESOLVED VERSION"
+      for d in "$BCL_HOME"/artifacts/*/; do
+        [ -d "$d" ] || continue
+        printf '%-36s %-8s %s\n' "$(basename "$d")" "$(du -sh "$d" 2>/dev/null | cut -f1)" "$(artifact_version "$d")"
+      done
+      df -h "$BCL_HOME" | awk 'NR==2{print "free under '"$BCL_HOME"': "$4}'
+      ;;
+    rm)
+      [ $# -ge 1 ] || die "usage: bcl artifacts rm <key>   (see bcl artifacts ls)"
+      local k="$1" f
+      [[ "$k" =~ ^[a-z0-9._-]+$ ]] || die "invalid key"
+      for f in "$BCL_HOME"/instances/*/instance.env; do
+        [ -f "$f" ] && grep -q "BC_ARTIFACTS_DIR=.*/artifacts/$k\$" "$f" && warn "instance $(basename "$(dirname "$f")") uses $k — it will re-download on next bcl up"
+      done
+      rm -rf "${BCL_HOME:?}/artifacts/$k"; ok "removed artifacts $k"
+      ;;
+    *) die "usage: bcl artifacts [ls|rm <key>]" ;;
+  esac
+}
+
+cmd_versions() {
+  local type="sandbox" country="w1" major="" all=0
+  while [ $# -gt 0 ]; do case "$1" in --type) type="$2"; shift 2 ;; -c|--country) country="$2"; shift 2 ;; --major) major="$2"; shift 2 ;; --all) all=1; shift ;; *) die "unknown option: $1" ;; esac; done
+  [[ "$major" =~ ^[0-9]*$ ]] || die "--major must be a number"
+  curl -fsS --max-time 30 "$ARTIFACT_INDEX_BASE/$type/indexes/$country.json" | python3 -c '
+import json, sys
+major, floor, show_all = sys.argv[1], int(sys.argv[2]), sys.argv[3] == "1"
+rows = json.load(sys.stdin)
+vs = sorted({r["Version"] for r in rows}, key=lambda v: [int(x) for x in v.split(".")])
+best = {}
+for v in vs:
+    p = v.split("."); best[".".join(p[:2])] = v
+majors = sorted({int(k.split(".")[0]) for k in best})
+latest = majors[-1]
+label = {latest: "supported: latest", latest - 1: "supported: previous"}
+for k, v in best.items():
+    m = int(k.split(".")[0])
+    if major and str(m) != major: continue
+    if not major and not show_all and m < floor: continue
+    tag = label.get(m, "below supported window" if m < floor else "")
+    print(f"{k:8} newest {v:22} {tag}")
+' "$major" "$BCL_MIN_MAJOR" "$all" || die "could not read the artifact index"
+}
+
+cmd_doctor() {
+  local project=""
+  while [ $# -gt 0 ]; do case "$1" in --project) project="$2"; shift 2 ;; *) die "unknown option: $1" ;; esac; done
+  local bad=0 root free_mb avail_mb
+  echo "${C_B}bcl doctor${C_0} (bcl $BCL_TOOL_VERSION, home $BCL_HOME, pinned upstream ${PINNED_REF:0:12})"
+  if docker info >/dev/null 2>&1; then ok "docker daemon $(docker version -f '{{.Server.Version}}' 2>/dev/null)"; else warn "docker daemon NOT reachable"; bad=1; fi
+  if docker compose version >/dev/null 2>&1; then ok "$(docker compose version | head -1)"; else warn "docker compose v2 missing"; bad=1; fi
+  local t; for t in git curl python3 unzip flock rsync; do have "$t" && ok "$t" || { warn "$t missing"; bad=1; }; done
+  have al && ok "al $(al --version 2>/dev/null | head -1 | cut -c1-30) (compile; 'al runtests' for --runner altool)" || warn "al not on PATH (only needed to compile / altool runner)"
+  find_bcdev >/dev/null 2>&1 && ok "bcdev ($(find_bcdev))" || warn "bcdev not found (optional: only --runner bcdev uses it; BCL_BCDEV overrides the lookup)"
+  avail_mb=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+  [ "$avail_mb" -ge 7500 ] && ok "RAM available ${avail_mb} MB (≈ $((avail_mb / 7000)) instance(s))" || warn "RAM available ${avail_mb} MB — one instance wants ~6-8 GB"
+  root=$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)
+  free_mb=$(df -Pm "$root" 2>/dev/null | awk 'NR==2{print $4}')
+  [ "${free_mb:-0}" -ge 2500 ] && ok "Docker disk $root: ${free_mb} MB free" || warn "Docker disk $root: ${free_mb:-?} MB free (images ~3 GB + ~2.5 GB per instance)"
+  mkdir -p "$BCL_HOME"; free_mb=$(df -Pm "$BCL_HOME" | awk 'NR==2{print $4}')
+  [ "$free_mb" -ge 6500 ] && ok "artifact disk $BCL_HOME: ${free_mb} MB free" || warn "artifact disk $BCL_HOME: ${free_mb} MB free (≈3.2 GB per BC version + 2.4 GB while downloading)"
+  local c
+  c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$ARTIFACT_INDEX_PROBE" || true); [ "$c" = "200" ] && ok "BC artifact CDN reachable" || { warn "BC artifact CDN HTTP $c ($ARTIFACT_INDEX_PROBE) — check sbx network policy"; bad=1; }
+  c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 https://ghcr.io/v2/ || true); [ "$c" = "401" ] || [ "$c" = "200" ] && ok "ghcr.io reachable" || { warn "ghcr.io HTTP $c — image pulls will fail"; bad=1; }
+  c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 https://github.com || true); [ "$c" = "200" ] || [ "$c" = "301" ] && ok "github.com reachable" || { warn "github.com HTTP $c — upstream checkout will fail"; bad=1; }
+  local img
+  for img in "$IMAGE_REPO:$PINNED_REF" "$SQL_IMAGE_DEFAULT"; do docker image inspect "$img" >/dev/null 2>&1 && ok "image cached: ${img##*/}" || log "  image not cached yet (pulled on first up): ${img##*/}"; done
+  if [ -n "$project" ]; then
+    if grep -rqiE --include='*.al' 'OptimizeForTextSearch[[:space:]]*=[[:space:]]*true' "$project" 2>/dev/null; then
+      warn "project $project uses OptimizeForTextSearch → start BC with: bcl up --fts"
+    else ok "project $project needs no full-text search"; fi
+  fi
+  [ -n "${SANDBOX_NAME:-}" ] && log "sandbox: $SANDBOX_NAME (host access to a port: sbx ports $SANDBOX_NAME --publish <port>:<port>)"
+  echo; cmd_ls 2>/dev/null || true
+  return $bad
+}
+
+cmd_install() {  # put a `bcl` wrapper on PATH (works even if the skill folder has no exec bits)
+  local target="" w
+  w=$(printf '#!/usr/bin/env bash\n# installed by bcl install — forwards to the bc-linux skill\nexec bash %q "$@"\n' "$SKILL_DIR/bin/bcl")
+  if [ -w /usr/local/bin ] || sudo -n true 2>/dev/null; then
+    target=/usr/local/bin/bcl
+    printf '%s\n' "$w" | { if [ -w /usr/local/bin ]; then cat > "$target"; else sudo -n tee "$target" >/dev/null; fi; }
+    { [ -w "$target" ] && chmod 0755 "$target"; } || sudo -n chmod 0755 "$target"
+  else
+    mkdir -p "$HOME/.local/bin"; target="$HOME/.local/bin/bcl"
+    printf '%s\n' "$w" > "$target"; chmod 0755 "$target"
+    case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) warn "$HOME/.local/bin is not on PATH — call $target directly" ;; esac
+  fi
+  ok "installed $target → $SKILL_DIR/bin/bcl"
+}
+
+cmd_update() {
+  local head; head=$(git ls-remote "$UPSTREAM_REPO" refs/heads/master | cut -f1)
+  echo "pinned upstream : $PINNED_REF"
+  echo "upstream master : $head"
+  if [ "$head" = "$PINNED_REF" ]; then ok "pinned ref is upstream master"; return 0; fi
+  local d; d=$(ensure_upstream "$PINNED_REF")
+  git -C "$d" fetch --quiet origin master >/dev/null 2>&1 || true
+  echo "new upstream commits since the pin:"
+  git -C "$d" log --oneline "$PINNED_REF..$head" 2>/dev/null | head -30 | sed 's/^/  /' || echo "  (could not list)"
+  echo
+  echo "Try them on an instance:  bcl up --name <n> --ref master   (or a specific sha)"
+  echo "If good, bump PINNED_REF in $SKILL_DIR/bin/bcl and note it in SKILL.md."
+}
+
+usage_up() {
+  cat <<'EOF'
+bcl up [--name N] [options]        create or start an instance and wait until it serves
+
+  -v, --version V      BC version: latest | previous | 28 | 28.5 | 28.5.54151.55965 (default: previous).
+                       latest/previous = current/previous released major (SaaS lifecycle); a short
+                       version means its newest build. Supported: BC28 and newer.
+  -c, --country C      w1 (default), dk, de, us, ...
+      --type T         sandbox (default) | onprem
+      --artifact-url U full artifact URL (insider/preview builds)
+      --fts / --no-fts SQL image with full-text search (needed by apps using OptimizeForTextSearch)
+      --project DIR    auto-detect --fts by scanning DIR for OptimizeForTextSearch
+      --no-webclient   skip the (experimental) web client; --runner bcdev then won't work
+      --no-frontdoor   no single-port proxy (implies --no-webclient unless --webclient)
+      --license FILE   import your own .bclicense before NST starts
+      --user U --password P   NavUserPassword login (default BCRUNNER / Admin123!)
+      --clear-apps M   upstream BC_CLEAR_ALL_APPS: false (default) | selective | deps-only | true | none
+      --keep-app-ids L comma list for --clear-apps selective
+      --env KEY=VALUE  pass any upstream variable (repeatable; persisted). --reset-env clears them
+      --slot N         port slot 0-9 (ports +N*100); default: first free
+      --ref R          upstream MsDyn365Bc.On.Linux ref: sha | master | pinned (default: the instance's
+                       existing ref, else the pinned verified commit)
+      --refresh        re-resolve the version and re-download artifacts if Microsoft shipped a newer build
+      --timeout MIN    readiness timeout (default 30)
+      --snapshot L     boot with the database restored from snapshot L (bcl snapshot save); remembered
+                       by the instance; --snapshot none returns to a fresh CRONUS
+      --no-wait        return right after starting; then: bcl wait
+      --force          skip RAM/disk refusals
+EOF
+}
+
+usage() {
+  cat <<EOF
+bcl $BCL_TOOL_VERSION — Business Central on Linux inside this sandbox (MsDyn365Bc.On.Linux)
+
+lifecycle
+  bcl doctor [--project DIR]        preflight: docker, disk, RAM, network, tools, FTS need
+  bcl up [--name N] [opts]          create/start + wait healthy   (bcl up --help for options)
+  bcl wait [--name N]               wait until healthy (after up --no-wait)
+  bcl status [--name N] [--json]    state, version, probes, URLs, memory
+  bcl ls                            all instances
+  bcl logs [bc|sql|frontdoor|webclient] [--tail N] [-f]
+  bcl restart [--hard]              soft = NST only, keeps DB/apps; --hard = recreate (DB resets)
+  bcl down [--purge] [--all]        stop (keeps warm volumes); --purge also deletes volumes + instance
+
+develop
+  bcl workcopy REPO [DIR ...] [--as L] [--alias LINK=TARGET]   sandbox-local copy of the CURRENT working tree,
+                                                           app.json stamped for the instance (stdout: path)
+  bcl compile PROJECT [--extra dep.app] [--out F]          symbols + al compile (stdout: .app path)
+  bcl symbols --app-json P [--out DIR] [--extra dep.app]   stage .alpackages from the instance's artifacts
+  bcl publish [--sync-mode M] A.app [B.app ...]            publish in dependency order (default ForceSync)
+  bcl apps [--all]                                         published/installed extensions
+  bcl test --app T.app [--codeunit-range R | --codeunit ID [--method M]] [--junit-output F]
+           [--runner websocket|altool|hybrid|bcdev] [--company C] [--timeout MIN] [-- extra runner args]
+  bcl snapshot save <label>          back up the live database (apps installed) for fast re-boots
+  bcl snapshot ls | rm <label>       list / delete snapshots (stored per BC build under $BCL_HOME/snapshots)
+  bcl snapshot restore <label>       = bcl up --snapshot <label>
+  bcl env                            export lines (BC_DEV_URL, BC_USERNAME, BC_LAUNCH_JSON, ...)
+  bcl launch-json [--merge FILE]     print the instance launch.json, or merge its configs into FILE
+  bcl sql "<T-SQL>"                  query the BC database (sqlcmd in the sql container)
+  bcl exec [-- cmd]                  run a command in the bc container (default: bash)
+
+maintenance
+  bcl versions [--major 28] [-c dk] [--all]   released BC builds (default: the supported window, BC28+)
+  bcl artifacts [ls|rm KEY]          host-side artifact cache under \$BCL_HOME/artifacts
+  bcl update                         compare the pinned upstream with master
+  bcl install                        put a 'bcl' command on PATH (/usr/local/bin or ~/.local/bin)
+
+Every command takes --name N (default: \$BCL_INSTANCE or "default").
+EOF
+}
+
+cmd_help_for() {  # print the usage lines of one command (and their indented continuations)
+  usage | awk -v c="$1" '
+    $1 == "bcl" && $2 == c { on = 1; print; next }
+    on && /^ {10,}/ { print; next }
+    { on = 0 }'
+}
+
+main() {
+  local cmd="${1:-help}"; shift || true
+  if [ "$cmd" != "up" ] && [ "$cmd" != "help" ]; then
+    local a; for a in "$@"; do case "$a" in -h|--help) cmd_help_for "$cmd"; return 0 ;; esac; done
+  fi
+  case "$cmd" in
+    up|start) cmd_up "$@" ;;
+    wait) cmd_wait "$@" ;;
+    status|info) cmd_status "$@" ;;
+    ls|list) cmd_ls "$@" ;;
+    logs) cmd_logs "$@" ;;
+    down|stop) cmd_down "$@" ;;
+    restart) cmd_restart "$@" ;;
+    publish) cmd_publish "$@" ;;
+    apps) cmd_apps "$@" ;;
+    symbols) cmd_symbols "$@" ;;
+    workcopy) cmd_workcopy "$@" ;;
+    compile) cmd_compile "$@" ;;
+    test) cmd_test "$@" ;;
+    env) cmd_env "$@" ;;
+    launch-json) cmd_launch_json "$@" ;;
+    sql) cmd_sql "$@" ;;
+    exec) cmd_exec "$@" ;;
+    webclient) cmd_webclient "$@" ;;
+    artifacts) cmd_artifacts "$@" ;;
+    snapshot|snap) cmd_snapshot "$@" ;;
+    versions) cmd_versions "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    update) cmd_update "$@" ;;
+    install) cmd_install "$@" ;;
+    version|--version) echo "bcl $BCL_TOOL_VERSION (pinned upstream $PINNED_REF)" ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; die "unknown command: $cmd" ;;
+  esac
+}
+
+# `exit` on the same line: bash reads scripts lazily, so a bcl edited/upgraded while an
+# instance is booting must never have its remainder executed by the running process.
+main "$@"; exit $?
