@@ -1,0 +1,21 @@
+#!/bin/sh
+# review gate (review-flow plugin, installed by its hooks/install-gate.sh; see the project's REVIEW.md)
+# A commit made from Claude Code (CLAUDECODE is set in its shells) goes through only when the review-change skill has
+# reviewed exactly the tree it commits (.tmp/review/<tree>.md; for `commit -a` and `commit <paths>` git hands this
+# hook the index it commits), when it changes notes under docs/ only (docs/**/*.md; a renamed file counts by both
+# names), when it changes nothing (a message-only amend), or when a message line starts with "Not reviewed:" (only when
+# the maintainer asked for it). Commits made by hand pass, and so do projects without a REVIEW.md and merges (their
+# commits were reviewed where they were made; a hand-resolved conflict or an edit added to a merge is not). An --amend
+# is compared with the commit it replaces. Git runs no hook for revert, cherry-pick or a rebase without reword, and
+# --no-verify skips it: the gate guards against forgetting the review, not against an agent that wants around it.
+# Git runs hooks at the top of the working tree.
+[ -n "$CLAUDECODE" ] || exit 0
+[ -f REVIEW.md ] || exit 0
+git rev-parse -q --verify MERGE_HEAD >/dev/null && exit 0
+files=$(git -c core.quotePath=false diff --cached --name-only --no-renames) || files=?
+[ -z "$files" ] && exit 0
+printf '%s\n' "$files" | grep -qv '^docs/.*\.md$' || exit 0
+grep -q '^Not reviewed:' "$1" && exit 0
+tree=$(git write-tree) && [ -f ".tmp/review/$tree.md" ] && exit 0
+echo 'This commit holds a tree that has not been reviewed (CLAUDECODE is set, so it counts as made from Claude Code): run the review-change skill and commit what it reviewed (no -a, no paths). Only when the maintainer asked to skip the review: a message line "Not reviewed: <reason>".' >&2
+exit 1

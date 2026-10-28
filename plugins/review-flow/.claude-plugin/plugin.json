@@ -1,0 +1,10 @@
+{
+  "name": "review-flow",
+  "version": "1.0.0",
+  "description": "Review each topic before Claude commits it, with effort that follows how critical the change is: the project's REVIEW.md (checks, risk tiers, what reviewers skip), the review-change and review-setup skills, and a git commit-msg gate that refuses Claude's commits until exactly the committed tree was reviewed.",
+  "author": {
+    "name": "Jakub Vaňák",
+    "email": "vanak.jakub@gmail.com"
+  },
+  "keywords": ["code-review", "git", "workflow", "quality"]
+}

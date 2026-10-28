@@ -6,14 +6,22 @@ Jakub Vaňák's Claude Code plugin marketplace (`koubek-plugins`).
 |---|---|
 | [`bc-linux`](plugins/bc-linux) | Runs a real Business Central (NST + SQL Server) inside an sbx sandbox with Docker, using [StefanMaron/MsDyn365Bc.On.Linux](https://github.com/StefanMaron/MsDyn365Bc.On.Linux). The `bcl` CLI covers instances, DB snapshots, work copies, compile, publish and AL test runners. Supports BC28 and newer, following the SaaS lifecycle. Generic, nothing NP-specific. |
 | [`npcore-bc-linux`](plugins/npcore-bc-linux) | NpCore / NP Retail companion to `bc-linux`: the verified recipe for NP Retail + NP Retail Tests. Depends on `bc-linux`. |
+| [`review-flow`](plugins/review-flow) | Reviews each topic before Claude commits it, with effort that follows how critical the change is. A project opts in with a `REVIEW.md` (`/review-flow:review-setup` drafts it). `review-change` then runs the checks and reviewers its risk tier asks for and writes a record. A git commit-msg gate refuses Claude's commits whose exact tree was not reviewed (commits made by hand, merges and `docs/**/*.md`-only commits pass). |
 
 ## Install
 
 ```bash
-claude plugin marketplace add Koubek/claude-plugins        # private repo: uses your git credentials
+claude plugin marketplace add Koubek/claude-plugins
 claude plugin install bc-linux@koubek-plugins
 claude plugin install npcore-bc-linux@koubek-plugins       # pulls in bc-linux as a dependency
+claude plugin install review-flow@koubek-plugins
 ```
+
+**review-flow** does nothing in a repository without a `REVIEW.md`. In one that has it, each session start
+installs the gate as git's commit-msg hook (`.git/hooks/commit-msg`; `git rev-parse --git-path hooks/commit-msg`
+in a worktree or submodule). It never writes over another hook and skips when `core.hooksPath` is set; in both
+cases it says so. Merges pass: their commits were reviewed where they were made, but a hand-resolved conflict
+is not. The gate stays installed after the plugin is turned off; delete that file to remove it.
 
 Restart Claude Code, or run `/reload-plugins`. `bcl` is then on the Bash tool's PATH and the
 skills load on their own when a task needs them (`/bc-linux:bc-linux` to force one).
@@ -32,6 +40,7 @@ plugins/<plugin>/
   bin/                              on the Bash tool's PATH while the plugin is enabled
   skills/<skill>/SKILL.md           skills (+ their scripts and reference docs)
 evals/                              trigger evals (not shipped)
+tests/                              node:test tests (not shipped): node --test "tests/*.test.mjs"
 ```
 
 - Validate: `claude plugin validate .` and `claude plugin validate plugins/<plugin>`.
