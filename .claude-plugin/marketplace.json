@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "koubek-plugins",
-  "description": "Jakub Vaňák's Claude Code plugins: Business Central on Linux inside Docker sandboxes, and companions.",
+  "description": "Jakub Vaňák's Claude Code plugins: Business Central on Linux inside Docker sandboxes, and companions; a review flow for any repository.",
   "owner": {
     "name": "Jakub Vaňák",
     "email": "vanak.jakub@gmail.com"
@@ -20,6 +20,13 @@
       "description": "NpCore / NP Retail companion to bc-linux: the verified recipe for NP Retail + NP Retail Tests on a local BC28/BC29.",
       "category": "development",
       "tags": ["business-central", "al", "navipartner", "np-retail"]
+    },
+    {
+      "name": "review-flow",
+      "source": "./plugins/review-flow",
+      "description": "Review each topic before Claude commits it, with effort that follows how critical the change is: a REVIEW.md per project, the review-change and review-setup skills, and a git gate that refuses Claude's unreviewed commits.",
+      "category": "development",
+      "tags": ["code-review", "git", "workflow", "quality"]
     }
   ]
 }

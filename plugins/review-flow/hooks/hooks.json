@@ -1,0 +1,16 @@
+{
+  "description": "Installs the review gate (git commit-msg hook) in a project that has a REVIEW.md",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/install-gate.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}
